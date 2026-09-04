@@ -1,4 +1,5 @@
-# NanoChronometer
+![Descripción](./assets/nanochronometer_logo.svg)
+
 
 Nanosecond-resolution stopwatch, precision clock and ISA microbenchmark
 toolkit, built directly on the architectural counters — `RDTSC`/`RDTSCP` on
