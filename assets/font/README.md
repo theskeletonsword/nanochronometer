@@ -1,34 +1,35 @@
 # Custom Font — NanoChrono
 
-Coloca aquí **un único archivo** `.ttf` o `.otf` y el motor lo cargará automáticamente al iniciar.
+Place **a single file** with the `.ttf` or `.otf` extension here, and the engine will load it automatically at startup.
 
-## ¿Cómo funciona?
-1. Al arrancar, `try_load_custom_font()` busca el primer `*.ttf` / `*.otf` en esta carpeta.
-2. Lee el **family name** directamente desde la tabla `name` del binario (nameID=1, plataforma Windows Unicode).
-3. Registra la fuente en memoria con `AddFontMemResourceEx` (privado, no persiste en el sistema).
-4. Si ese método falla, reintenta con `AddFontResourceExW` (FR_PRIVATE).
-5. Llama a `CreateFontW` con ese family name: GDI ya conoce la fuente porque acabamos de registrarla.
+## How does it work?
+1. At startup, `try_load_custom_font()` searches for the first `*.ttf` / `*.otf` file in this folder.
+2. It reads the **family name** directly from the binary’s `name` table (nameID=1, Windows Unicode platform).
+3. It registers the font in memory using `AddFontMemResourceEx` (private; does not persist on the system).
+4. If that method fails, it retries with `AddFontResourceExW` (FR_PRIVATE).
+5. Call `CreateFontW` with that family name: GDI already knows the font because we just registered it.
 
-## ¿Cuál family name usa GDI?
-Si no sabes el nombre exacto que GDI usará, ejecuta el helper:
+## Which family name does GDI use?
+If you don’t know the exact name that GDI will use, run the helper:
 
 ```
-python check_font_name.py assets\font\TuFuente.ttf
+python check_font_name.py assets\font\YourFont.ttf
 ```
 
-Verás algo como:
+You’ll see something like:
 ```
-Family name (nameID=1, Win Unicode): "JetBrains Mono"
+Family name (nameID=1, Win Unicode): “JetBrains Mono”
 ```
-Ese es el string que se pasará a CreateFontW.
+That’s the string to pass to `CreateFontW`.
 
-## Recomendaciones de fuentes para un timer
-- **JetBrains Mono** — excelente legibilidad, monoespaciada, descarga gratuita
-- **Fira Code** — ligaduras opcionales, muy clara
-- **Cascadia Code** — fuente de Windows Terminal, muy legible
-- **Orbitron** (Google Fonts) — estética digital/retro, buena para cronómetros
+## Font recommendations for a timer
+- **JetBrains Mono** — excellent readability, monospaced, free to download
+- **Fira Code** — optional ligatures, very clear
+- **Cascadia Code** — Windows Terminal font, very legible
+- **Orbitron** (Google Fonts) — digital/retro aesthetic, good for stopwatches
 
-## Notas
-- Solo se carga el **primer** archivo encontrado (orden alfabético del sistema de archivos).
-- El tamaño de punto se calcula automáticamente para que el texto ocupe el 94% del ancho disponible.
-- Si la carpeta está vacía o el archivo no se puede parsear, se usa Consolas → Courier New como fallback.
+## Notes
+- Only the **first** file found is loaded (alphabetical order in the file system).
+- The point size is calculated automatically so that the text occupies 94% of the available width.
+- If the folder is empty or the file cannot be parsed, Consolas → Courier New is used as a fallback.
+
