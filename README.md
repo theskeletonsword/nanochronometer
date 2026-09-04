@@ -1,4 +1,4 @@
-![Descripción](./assets/nanochronometer_logo.svg)
+![Description](./assets/nanochronometer_logo.svg)
 
 
 Nanosecond-resolution stopwatch, precision clock and ISA microbenchmark
