@@ -1,0 +1,90 @@
+# The kernel is linked by its own script: the default layout assumes an OS
+# loader, and a multiboot image has to place its header in the first 32 KiB.
+#
+# `rust-lld` is invoked directly rather than through a compiler driver, so the
+# arguments here are linker arguments — `-nostartfiles` and friends are driver
+# flags and would be rejected.
+
+# `x86_64-nanochrono-none` is `x86_64-unknown-none` with `+sse,+sse2` and
+# without `+soft-float`. The built-in target refuses that combination — its ABI
+# is soft-float, so LLVM will not allocate an XMM register, and
+# `-Ctarget-feature=-soft-float` is deprecated and slated to become a hard
+# error (rust-lang/rust#116344). A target spec is the supported way to say it.
+#
+# That is what makes the SIMD probes usable here, and it is sound only because
+# boot32.S enables SSE (CR0.EM/MP, CR4.OSFXSR) and the XCR0 state before any
+# Rust runs. Without that every one of those instructions is #UD.
+#
+# The cost is nightly plus `rust-src`: a custom target has no precompiled
+# `core`, so it is built alongside. `x86_64-unknown-none` still works on stable
+# with the `simd` feature off, which is what `--stable` selects in build.sh.
+[target.x86_64-nanochrono-none]
+rustflags = [
+    # Recent nightlies gate loading a target spec from JSON behind this.
+    "-Z", "unstable-options",
+    # The red zone is 128 bytes below RSP that a leaf function may use without
+    # adjusting the stack pointer. In kernel code that is a trap: an interrupt
+    # or exception pushes onto the same stack and silently overwrites it, so a
+    # leaf function's locals change under it with nothing to see.
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    # The linker script is applied by build.rs, to the binary only: a static
+    # archive and a shared object must not be laid out as a kernel image.
+]
+
+[target.x86_64-unknown-none]
+# The stable fallback: soft-float ABI, so the `simd` feature is off.
+#
+# `relocation-model=static` keeps the image non-PIE: a multiboot kernel is
+# loaded at the fixed address the linker script names and nothing relocates it.
+rustflags = [
+    # The red zone is 128 bytes below RSP that a leaf function may use without
+    # adjusting the stack pointer. In kernel code that is a trap: an interrupt
+    # or exception pushes onto the same stack and silently overwrites it, so a
+    # leaf function's locals change under it with nothing to see. Both
+    # freestanding targets already set `disable-redzone` in their spec; it is
+    # repeated here because the failure is invisible and a custom target spec
+    # would not inherit it.
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    # The linker script is applied by build.rs, to the binary only: a static
+    # archive and a shared object must not be laid out as a kernel image.
+]
+
+# The same ABI as above, but as a loadable object: position independent,
+# dynamically linkable, no kernel code model and no linker script. A shared
+# object and a kernel image cannot share one spec — see
+# docs/BAREMETAL_LIBRARIES.md, which is also where the loader you have to
+# write is described.
+[target.x86_64-nanochrono-none-dylib]
+rustflags = [
+    "-Z", "unstable-options",
+    "-C", "no-redzone=yes",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    # The red zone is 128 bytes below RSP that a leaf function may use without
+    # adjusting the stack pointer. In kernel code that is a trap: an interrupt
+    # or exception pushes onto the same stack and silently overwrites it, so a
+    # leaf function's locals change under it with nothing to see. Both
+    # freestanding targets already set `disable-redzone` in their spec; it is
+    # repeated here because the failure is invisible and a custom target spec
+    # would not inherit it.
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tboot/aarch64.ld",
+]
+
+# Where the custom target spec lives. Relative to this file, so a checkout
+# works from any directory.
+[env]
+RUST_TARGET_PATH = { value = "targets", relative = true }
+
+[unstable]
+# A custom target has no precompiled `core`, so it is built from source.
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "x86_64-nanochrono-none"

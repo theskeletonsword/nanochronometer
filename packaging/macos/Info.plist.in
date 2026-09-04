@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>NanoChronometer</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.nanochronometer.NanoChrono</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>NanoChronometer</string>
+  <key>CFBundleDisplayName</key>
+  <string>NanoChronometer</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+
+  <!-- 11.0 is the first release that ran on Apple Silicon, so it is the floor
+       for a universal build: an arm64 slice below it has no machine to run
+       on. It must match MACOSX_DEPLOYMENT_TARGET in build.sh. -->
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+
+  <!-- A regular app: it gets a Dock icon, a menu bar and keyboard focus.
+       Without this the window opens behind everything and cannot be typed
+       into, which for a keyboard-driven stopwatch is the whole interface. -->
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+
+  <!-- The window is drawn entirely by the application, so the system should
+       not tint it for the current appearance; the GUI carries its own light
+       and dark palettes. -->
+  <key>NSRequiresAquaSystemAppearance</key>
+  <false/>
+</dict>
+</plist>

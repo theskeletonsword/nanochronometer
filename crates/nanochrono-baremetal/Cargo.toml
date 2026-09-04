@@ -1,0 +1,39 @@
+[package]
+name = "nanochrono-baremetal"
+version = "3.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/nanochronometer/nanochronometer"
+description = "Freestanding NanoChronometer: counters and PMU with no operating system underneath"
+
+[features]
+default = []
+# The SIMD probes. Needs a target whose ABI allows vector registers — the
+# custom `x86_64-nanochrono-none`, not the stable `x86_64-unknown-none`.
+simd = ["nanochrono-core/simd"]
+
+[dependencies]
+# The same crate the hosted build uses, with the OS-dependent half switched
+# off. The inline assembly is shared rather than reimplemented, which is the
+# whole point: a bare-metal kernel executes the same instruction sequences.
+nanochrono-core = { path = "../nanochrono-core", default-features = false }
+
+[lib]
+name = "nanochrono_baremetal"
+# A static archive to link into another kernel, and a shared object for one
+# that resolves symbols itself — there is no `ld.so` on bare metal, so the
+# second needs a loader the consumer writes. See docs/BAREMETAL_LIBRARIES.md.
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "nanochrono-kernel"
+path = "src/main.rs"
+# The kernel has no `main` and its own panic handler, neither of which a test
+# harness can link. The logic worth testing lives in the library.
+test = false
+bench = false
+
+# A freestanding binary has no unwinder and no runtime to unwind into.
+[profile.release]
+panic = "abort"

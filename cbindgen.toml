@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generates include/nanochrono.h from crates/nanochrono-ffi.
+#
+# The Rust source is the single source of truth for the C ABI. Nothing in this
+# repository is hand-written C: run tools/gen-header.sh to regenerate.
+
+language = "C"
+header = """/* SPDX-License-Identifier: Apache-2.0 */
+/* =============================================================================
+ * nanochrono.h — C ABI for NanoChronometer
+ *
+ * GENERATED FILE. Do not edit.
+ *
+ * Regenerate with tools/gen-header.sh. The declarations are derived from
+ * crates/nanochrono-ffi/src/lib.rs, which is the single source of truth: the
+ * implementation is Rust and there is no hand-written C in this project.
+ *
+ * This header exists only so C, cgo and Zig consumers have declarations; the
+ * Python, Java, C#, Node and Lua wrappers declare their own bindings and do
+ * not need it.
+ *
+ * Link against libnanochrono.so / .dll / .dylib (shared) or
+ * libnanochrono.a / nanochrono.lib (static), built with:
+ *     cargo build --release -p nanochrono-ffi
+ *
+ * Contract:
+ *   - A NULL nc_ctx_t* is never a crash. Accessors return documented defaults.
+ *   - No function unwinds. Failures come back as status codes.
+ *   - Buffer writers respect `cap` and always NUL-terminate.
+ * ========================================================================== */"""
+include_guard = "NANOCHRONO_H"
+cpp_compat = true
+documentation = true
+documentation_style = "c"
+tab_width = 4
+style = "type"
+
+[export]
+prefix = ""
+
+[export.rename]
+"nc_ctx" = "nc_ctx_t"
+
+[parse]
+parse_deps = false
+
+[enum]
+prefix_with_name = true

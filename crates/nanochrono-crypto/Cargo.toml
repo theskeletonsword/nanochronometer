@@ -1,0 +1,19 @@
+[package]
+name = "nanochrono-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cryptographic primitives and TLS handshake timing, backed by the rustls crypto provider"
+
+[dependencies]
+# `ring` is the crypto provider for both rustls and the standalone primitives
+# below, so there is exactly one implementation of AES-GCM, ChaCha20-Poly1305,
+# SHA-256 and HMAC in the tree. rustls' default provider (`aws-lc-rs`) is
+# turned off because it drags in cmake and a C toolchain, which is precisely
+# the build-time dependency this migration set out to remove.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+webpki-roots = "1"

@@ -1,0 +1,19 @@
+[package]
+name = "nanochrono-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI for NanoChronometer, so the existing language wrappers keep working"
+
+[lib]
+name = "nanochrono"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+nanochrono-core.workspace = true
+nanochrono-crypto.workspace = true
+
+[dev-dependencies]
+libloading = "0.8"

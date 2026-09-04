@@ -1,0 +1,31 @@
+# Rust
+/target/
+# nanochrono-baremetal is outside the workspace, so it has its own.
+/crates/nanochrono-baremetal/target/
+
+# Cross-build output (packaging/android/build.sh)
+/dist/
+**/*.rs.bk
+
+# Benchmark output
+*.log
+*.csv
+nanochrono-results.csv
+nanochrono-bench-*.log
+
+# Editors and desktop cruft
+desktop.ini
+.DS_Store
+
+# Generated from the Rust FFI crate by tools/gen-header.sh
+/include/nanochrono.h
+
+# Kernel module build artifacts (kernel/linux)
+*.ko
+*.mod
+*.mod.c
+*.o
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/

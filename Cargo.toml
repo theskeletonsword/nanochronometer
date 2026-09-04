@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nanochrono-core",
+    "crates/nanochrono-crypto",
+    "crates/nanochrono-bench",
+    "crates/nanochrono-cli",
+    "crates/nanochrono-gui",
+    "crates/nanochrono-ffi",
+]
+
+# Freestanding: it targets `x86_64-unknown-none`/`aarch64-unknown-none`, has no
+# `main`, and links through its own script. `cargo build --workspace` would try
+# to build it for the host and fail, so it is its own root and is built by
+# packaging/baremetal/build.sh.
+exclude = ["crates/nanochrono-baremetal"]
+
+[workspace.package]
+version = "3.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/nanochronometer/nanochronometer"
+description = "Nanosecond-resolution chronometer, clock and ISA microbenchmark toolkit"
+
+[workspace.dependencies]
+nanochrono-core = { path = "crates/nanochrono-core", version = "3.0.0" }
+nanochrono-crypto = { path = "crates/nanochrono-crypto", version = "3.0.0" }
+nanochrono-bench = { path = "crates/nanochrono-bench", version = "3.0.0" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Measurement code must not be folded away by the optimiser in ways a debug
+# build would hide, so the bench profile mirrors release.
+[profile.bench]
+inherits = "release"

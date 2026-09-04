@@ -1,0 +1,7 @@
+local ncmod = require("nanochronometer")
+local nc = ncmod.new()
+nc:calibrate(50)
+print("native overhead cycles:", nc:native_overhead_cycles())
+print("LuaJIT -> native cycles:", nc:ffi_overhead_cycles(10000))
+print("native -> Lua callback min cycles:", nc:callback_min_cycles(function(_) end, 10000))
+nc:close()

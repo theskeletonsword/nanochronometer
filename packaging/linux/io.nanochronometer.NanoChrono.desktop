@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=NanoChronometer
+GenericName=Precision Chronometer
+Comment=Nanosecond-resolution stopwatch, precision clock and ISA microbenchmark toolkit
+Exec=nanochrono-gui
+Icon=io.nanochronometer.NanoChrono
+Terminal=false
+Categories=Utility;Development;Profiling;
+Keywords=stopwatch;timer;clock;benchmark;profiler;tsc;rdtsc;perf;
+StartupNotify=true
+# Must match the application_id the window sets, or Wayland compositors cannot
+# associate the surface with this entry and the window shows a default icon.
+StartupWMClass=io.nanochronometer.NanoChrono

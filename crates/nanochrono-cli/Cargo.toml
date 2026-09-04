@@ -1,0 +1,19 @@
+[package]
+name = "nanochrono-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line front end for the NanoChronometer toolkit"
+
+[[bin]]
+name = "nanochrono"
+path = "src/main.rs"
+
+[dependencies]
+nanochrono-core.workspace = true
+nanochrono-crypto.workspace = true
+nanochrono-bench.workspace = true
+clap = { version = "4.6.6", features = ["derive"] }
+ctrlc = "3.5.2"

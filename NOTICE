@@ -1,0 +1,62 @@
+NanoChronometer
+Copyright 2026 NanoChronometer contributors
+
+This product includes software developed by the NanoChronometer contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations under
+the License.
+
+--------------------------------------------------------------------------
+Licensing exception: kernel/linux/
+--------------------------------------------------------------------------
+
+The optional Linux kernel module under kernel/linux/ is dual licensed
+MIT OR GPL-2.0-only, not Apache-2.0. It is written in Rust, like the rest of
+the project, but the licence is a constraint the kernel imposes. The kernel accepts only a fixed set of
+MODULE_LICENSE idents and none of them is Apache; anything outside that set
+taints the kernel on load and loses access to GPL-only symbols. Apache-2.0 is
+also generally held to be incompatible with GPLv2, which the kernel is.
+
+That directory shares no source with the rest of the project and communicates
+only through a text file in /proc, so the boundary is clean. The module is
+optional: nothing in the toolkit requires it.
+
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+This software links the following dependencies, which carry their own terms.
+Redistributing a NanoChronometer binary means redistributing these too; their
+license texts must accompany it. See docs/THIRD_PARTY_NOTICES.md for the full
+release layout.
+
+  ring                  Apache-2.0 AND ISC AND OpenSSL
+                        The crypto provider. Contains code derived from
+                        BoringSSL, which carries the OpenSSL and ISC licenses;
+                        see the LICENSE files in the ring crate.
+
+  rustls                Apache-2.0 OR ISC OR MIT
+  rustls-webpki         ISC
+  rustls-pki-types      Apache-2.0 OR MIT
+  webpki-roots          MPL-2.0
+                        Mozilla's root certificate set, redistributed as data.
+
+  libc                  Apache-2.0 OR MIT
+  windows-sys           Apache-2.0 OR MIT
+  clap                  Apache-2.0 OR MIT
+  ctrlc                 Apache-2.0 OR MIT
+  tokio                 MIT
+  iced                  MIT
+                        Desktop GUI only; not linked into the libraries, the
+                        CLI, or any Android artifact.
+
+Run `cargo tree --format "{p} {l}"` for the complete, version-exact list.

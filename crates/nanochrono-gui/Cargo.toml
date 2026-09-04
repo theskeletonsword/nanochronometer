@@ -1,0 +1,19 @@
+[package]
+name = "nanochrono-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Iced desktop front end for the NanoChronometer toolkit"
+
+[[bin]]
+name = "nanochrono-gui"
+path = "src/main.rs"
+
+[dependencies]
+nanochrono-core.workspace = true
+nanochrono-crypto.workspace = true
+nanochrono-bench.workspace = true
+iced = { version = "0.13.1", features = ["canvas", "image", "tokio"] }
+tokio = { version = "1.53.1", features = ["rt"] }

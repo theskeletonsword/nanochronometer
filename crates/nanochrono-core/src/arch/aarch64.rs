@@ -1,0 +1,584 @@
+// SPDX-License-Identifier: Apache-2.0
+//! AArch64 counter and probe primitives.
+//!
+//! Mirrors [`super::x86_64`] one-for-one so the dispatchers above can stay
+//! architecture-agnostic. Everything the old `asm/arm64/**/*.S` files emitted
+//! lives here as `core::arch::asm!`.
+//!
+//! The architectural counter is `CNTVCT_EL0`, which ticks at `CNTFRQ_EL0` Hz
+//! (typically 24 MHz) rather than at core frequency. That makes its raw units
+//! coarser than an x86 TSC cycle but immune to frequency scaling, so no
+//! invariance check is needed.
+
+use core::arch::asm;
+
+// ---------------------------------------------------------------------------
+// Counter reads
+// ---------------------------------------------------------------------------
+
+/// Raw `CNTVCT_EL0`. No barrier: reads may be reordered around it.
+#[inline(always)]
+pub fn cntvct_raw() -> u64 {
+    let v: u64;
+    unsafe {
+        asm!("mrs {v}, cntvct_el0", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// `ISB` + `CNTVCT_EL0`: the ordered read used for interval boundaries.
+#[inline(always)]
+pub fn cntvct_isb() -> u64 {
+    let v: u64;
+    unsafe {
+        asm!(
+            "isb",
+            "mrs {v}, cntvct_el0",
+            v = out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    v
+}
+
+/// Raw `CNTPCT_EL0`, the *physical* counter.
+///
+/// `CNTVCT_EL0` is the virtual counter: it reads `CNTPCT_EL0` minus
+/// `CNTVOFF_EL2`, an offset a hypervisor sets so a guest sees a timeline
+/// starting when the guest did. That is the right counter for a hosted
+/// process, which lives inside whatever timeline it was given.
+///
+/// A freestanding kernel is not inside one. It runs at EL1 with no EL2 above
+/// it, so the offset is nothing but an extra subtraction against a value that
+/// may not be zero if firmware left it set — and the physical counter is what
+/// the hardware actually ticks.
+#[inline(always)]
+pub fn cntpct_raw() -> u64 {
+    let v: u64;
+    // SAFETY: CNTPCT_EL0 is readable at EL0 when CNTKCTL_EL1.EL0PCTEN allows
+    // it, and always at EL1. The read has no side effects.
+    unsafe {
+        asm!("mrs {v}, cntpct_el0", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// `ISB` + `DSB SY` + `CNTPCT_EL0`: the fully ordered physical read.
+///
+/// `ISB` alone orders the *instruction* stream, so the counter read cannot be
+/// hoisted past earlier instructions. It says nothing about memory: a store
+/// issued before the read may still be in flight when the counter is sampled,
+/// which for a measurement that brackets memory work means the interval ends
+/// before the work does.
+///
+/// `DSB SY` waits for that traffic to complete. Together they are what the
+/// ARM ARM prescribes for reading the counter as a timestamp rather than as a
+/// number — and they cost a few dozen cycles, which is why the hosted build
+/// uses the cheaper `ISB`-only form and this one is reserved for a kernel
+/// that is measuring the machine itself.
+#[inline(always)]
+pub fn cntpct_ordered() -> u64 {
+    let v: u64;
+    // SAFETY: as above; the barriers have no operands and no memory effects
+    // beyond ordering.
+    unsafe {
+        asm!(
+            "dsb sy",
+            "isb",
+            "mrs {v}, cntpct_el0",
+            "isb",
+            v = out(reg) v,
+            options(nostack, preserves_flags),
+        );
+    }
+    v
+}
+
+/// `CNTFRQ_EL0` — the counter's tick rate in Hz.
+#[inline]
+pub fn cntfrq() -> u64 {
+    let v: u64;
+    unsafe {
+        asm!("mrs {v}, cntfrq_el0", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// `CTR_EL0` — the Cache Type Register.
+///
+/// One of the handful of registers architecturally readable at EL0, so it
+/// costs nothing and cannot fault. Its cache-line geometry is a weak
+/// fingerprint: an emulator that does not model caches has to invent values.
+#[inline]
+pub fn ctr_el0() -> u64 {
+    let v: u64;
+    // SAFETY: CTR_EL0 is readable at EL0 on every ARMv8 implementation; the
+    // read has no side effects.
+    unsafe {
+        asm!("mrs {v}, ctr_el0", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// `DCZID_EL0` — the Data Cache Zero ID Register.
+///
+/// Also EL0-readable by architecture. Bit 4 (`DZP`) says whether `DC ZVA` is
+/// prohibited, which some emulators set because they do not implement it.
+#[inline]
+pub fn dczid_el0() -> u64 {
+    let v: u64;
+    // SAFETY: DCZID_EL0 is readable at EL0 by architecture, no side effects.
+    unsafe {
+        asm!("mrs {v}, dczid_el0", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// The cost of a bare counter read pair and of a synchronised one, in units.
+///
+/// `ISB` forces the pipeline to be re-fetched. Real silicon absorbs that in a
+/// few dozen cycles, so both numbers land within a small factor of each
+/// other. An emulator has to end its translation block and re-enter the
+/// dispatch loop, which costs orders of magnitude more — so the *ratio*
+/// between the two separates emulation from execution. Both sides are in
+/// counter units, so the counter's own frequency cancels out and the result
+/// is comparable across machines.
+///
+/// Minimum-of-N on both sides: anything above the minimum is interference,
+/// and interference is what must not leak into the ratio.
+pub fn barrier_cost_pair() -> (u64, u64) {
+    const ROUNDS: u32 = 256;
+
+    let bare = (0..ROUNDS)
+        .map(|_| {
+            let a = cntvct_raw();
+            let b = cntvct_raw();
+            b.wrapping_sub(a)
+        })
+        .min()
+        .unwrap_or(0);
+
+    let synchronised = (0..ROUNDS)
+        .map(|_| {
+            let a = cntvct_isb();
+            let b = cntvct_isb();
+            b.wrapping_sub(a)
+        })
+        .min()
+        .unwrap_or(0);
+
+    (bare, synchronised)
+}
+
+// `PMCCNTR_EL0` is deliberately absent.
+//
+// The C build read it directly behind a `NANOCHRONO_USE_PMCCNTR_EL0` opt-in,
+// which is an environment variable that says "please try an instruction that
+// may kill this process": the register traps to EL1 unless `PMUSERENR_EL0.EN`
+// is set, and there is no way to probe that from EL0 without taking the trap.
+// It is also not virtualised or context-switched, so a preempted thread reads
+// cycles that belonged to someone else.
+//
+// Cycle counting now goes through `perf_event_open` — see [`crate::perf`] —
+// which the kernel schedules per thread, saves across context switches, and
+// exposes without privileges.
+
+// ---------------------------------------------------------------------------
+// Barriers and hints
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+pub fn isb() {
+    unsafe { asm!("isb", options(nostack, preserves_flags)) }
+}
+
+#[inline(always)]
+pub fn dmb_sy() {
+    unsafe { asm!("dmb sy", options(nostack, preserves_flags)) }
+}
+
+#[inline(always)]
+pub fn dsb_sy() {
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) }
+}
+
+#[inline(always)]
+pub fn yield_hint() {
+    unsafe { asm!("yield", options(nomem, nostack, preserves_flags)) }
+}
+
+// ---------------------------------------------------------------------------
+// Scalar probes
+// ---------------------------------------------------------------------------
+
+/// Ticks for one dependent 64-bit load.
+///
+/// # Safety
+/// `ptr` must be a valid, aligned `*const u64`.
+#[inline]
+pub unsafe fn probe_load_ticks(ptr: *const u64) -> u64 {
+    let start = cntvct_isb();
+    let sink: u64;
+    unsafe {
+        asm!("ldr {v}, [{p}]", p = in(reg) ptr, v = out(reg) sink,
+             options(nostack, preserves_flags, readonly));
+    }
+    let end = cntvct_isb();
+    core::hint::black_box(sink);
+    end.wrapping_sub(start)
+}
+
+/// Ticks for one 64-bit load with a full system barrier on both sides.
+///
+/// # Safety
+/// `ptr` must be a valid, aligned `*const u64`.
+#[inline]
+pub unsafe fn probe_load_dsb_ticks(ptr: *const u64) -> u64 {
+    dsb_sy();
+    let start = cntvct_isb();
+    let sink: u64;
+    unsafe {
+        asm!("ldr {v}, [{p}]", p = in(reg) ptr, v = out(reg) sink,
+             options(nostack, preserves_flags, readonly));
+    }
+    dsb_sy();
+    let end = cntvct_isb();
+    core::hint::black_box(sink);
+    end.wrapping_sub(start)
+}
+
+/// Ticks for one 64-bit store.
+///
+/// # Safety
+/// `ptr` must be a valid, aligned, writable `*mut u64`.
+#[inline]
+pub unsafe fn probe_store_ticks(ptr: *mut u64, value: u64) -> u64 {
+    let start = cntvct_isb();
+    unsafe {
+        asm!("str {v}, [{p}]", "dmb sy", p = in(reg) ptr, v = in(reg) value,
+             options(nostack, preserves_flags));
+    }
+    let end = cntvct_isb();
+    end.wrapping_sub(start)
+}
+
+/// Ticks for a prefetch followed by a reload of the same line.
+///
+/// # Safety
+/// `ptr` must be a valid, aligned `*const u64`.
+#[inline]
+pub unsafe fn probe_prefetch_load_ticks(ptr: *const u64) -> u64 {
+    unsafe {
+        asm!("prfm pldl1keep, [{p}]", p = in(reg) ptr,
+             options(nostack, preserves_flags, readonly));
+        probe_load_ticks(ptr)
+    }
+}
+
+/// Ticks to walk `pattern` as a data-dependent branch sequence.
+///
+/// # Safety
+/// `pattern` must point to `count` readable bytes.
+#[inline]
+pub unsafe fn probe_branch_ticks(pattern: *const u8, count: usize) -> u64 {
+    let start = cntvct_isb();
+    let mut acc: u64 = 0;
+    for i in 0..count {
+        if unsafe { *pattern.add(i) } & 1 != 0 {
+            acc = acc.wrapping_add(1);
+        } else {
+            acc = acc.wrapping_mul(3);
+        }
+    }
+    let end = cntvct_isb();
+    core::hint::black_box(acc);
+    end.wrapping_sub(start)
+}
+
+/// Ticks to follow `steps` links of a pointer-chase list.
+///
+/// # Safety
+/// `first` must head a chain of at least `steps` valid links.
+#[inline]
+pub unsafe fn probe_pointer_chase_ticks(first: *const *const u8, steps: usize) -> u64 {
+    let start = cntvct_isb();
+    let mut p = first;
+    for _ in 0..steps {
+        if p.is_null() {
+            break;
+        }
+        p = unsafe { *p } as *const *const u8;
+    }
+    let end = cntvct_isb();
+    core::hint::black_box(p);
+    end.wrapping_sub(start)
+}
+
+/// Ticks for `iterations` back-to-back `DMB SY` barriers.
+#[inline]
+pub fn probe_barrier_ticks(iterations: u32) -> u64 {
+    let n = iterations.max(1);
+    let start = cntvct_isb();
+    for _ in 0..n {
+        dmb_sy();
+    }
+    let end = cntvct_isb();
+    end.wrapping_sub(start)
+}
+
+/// Back-to-back counter reads: the measurement floor.
+#[inline]
+pub fn read_overhead_ticks() -> u64 {
+    let a = cntvct_isb();
+    let b = cntvct_isb();
+    b.saturating_sub(a)
+}
+
+// ---------------------------------------------------------------------------
+// NEON probes and kernels
+// ---------------------------------------------------------------------------
+
+pub mod neon {
+    use super::*;
+
+    #[inline]
+    pub fn counter() -> u64 {
+        cntvct_isb()
+    }
+
+    /// # Safety
+    /// `ptr` must have 16 readable bytes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn vector_load_ticks(ptr: *const u8) -> u64 {
+        let start = cntvct_isb();
+        unsafe {
+            asm!("ldr q0, [{p}]", p = in(reg) ptr, out("q0") _,
+                 options(nostack, preserves_flags, readonly));
+        }
+        let end = cntvct_isb();
+        end.wrapping_sub(start)
+    }
+
+    /// # Safety
+    /// `a`/`b` must have 16 readable bytes, `out` 16 writable bytes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn vector_xor_ticks(a: *const u8, b: *const u8, out: *mut u8) -> u64 {
+        let start = cntvct_isb();
+        unsafe {
+            asm!(
+                "ldr q0, [{a}]",
+                "ldr q1, [{b}]",
+                "eor v0.16b, v0.16b, v1.16b",
+                "str q0, [{o}]",
+                a = in(reg) a, b = in(reg) b, o = in(reg) out,
+                out("q0") _, out("q1") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        let end = cntvct_isb();
+        end.wrapping_sub(start)
+    }
+
+    #[inline]
+    pub fn barrier_ticks(iterations: u32) -> u64 {
+        probe_barrier_ticks(iterations)
+    }
+}
+
+/// SVE probes.
+///
+/// SVE is vector-length agnostic, so the predicate covers whatever width the
+/// implementation exposes; `whilelo` derives it from the byte count rather
+/// than assuming 128 bits.
+pub mod sve {
+    use super::*;
+
+    #[inline]
+    pub fn counter() -> u64 {
+        cntvct_isb()
+    }
+
+    /// # Safety
+    /// Requires SVE. `ptr` must have `bytes` readable bytes.
+    #[inline]
+    #[target_feature(enable = "sve")]
+    pub unsafe fn vector_load_ticks(ptr: *const u8, bytes: usize) -> u64 {
+        let start = cntvct_isb();
+        unsafe {
+            asm!(
+                "whilelo p0.b, xzr, {n}",
+                "ld1b {{ z0.b }}, p0/z, [{p}]",
+                p = in(reg) ptr, n = in(reg) bytes,
+                out("p0") _, out("z0") _,
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        let end = cntvct_isb();
+        end.wrapping_sub(start)
+    }
+
+    /// # Safety
+    /// Requires SVE. `a`/`b` must have `bytes` readable bytes, `out` `bytes`
+    /// writable bytes.
+    #[inline]
+    #[target_feature(enable = "sve")]
+    pub unsafe fn vector_xor_ticks(a: *const u8, b: *const u8, out: *mut u8, bytes: usize) -> u64 {
+        let start = cntvct_isb();
+        unsafe {
+            asm!(
+                "whilelo p0.b, xzr, {n}",
+                "ld1b {{ z0.b }}, p0/z, [{a}]",
+                "ld1b {{ z1.b }}, p0/z, [{b}]",
+                "eor z0.d, z0.d, z1.d",
+                "st1b {{ z0.b }}, p0, [{o}]",
+                a = in(reg) a, b = in(reg) b, o = in(reg) out, n = in(reg) bytes,
+                out("p0") _, out("z0") _, out("z1") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        let end = cntvct_isb();
+        end.wrapping_sub(start)
+    }
+
+    #[inline]
+    pub fn barrier_ticks(iterations: u32) -> u64 {
+        probe_barrier_ticks(iterations)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Microbenchmark kernels
+// ---------------------------------------------------------------------------
+
+/// Scalar 64-bit ALU loop — the AArch64 baseline.
+#[inline(never)]
+pub fn kernel_scalar(loops: usize) -> u64 {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..loops {
+        unsafe {
+            asm!(
+                "ror {x}, {x}, #7",
+                "eor {x}, {x}, {c}",
+                "add {x}, {x}, {c}",
+                x = inout(reg) x,
+                c = in(reg) 0xD1B5_4A32_D192_ED03u64,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+    x
+}
+
+/// NEON integer loop.
+///
+/// # Safety
+/// Requires NEON, which is mandatory on AArch64 but still gated for symmetry
+/// with the optional families.
+#[inline(never)]
+#[target_feature(enable = "neon")]
+pub unsafe fn kernel_neon(loops: usize) -> u64 {
+    let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..loops {
+        unsafe {
+            asm!(
+                "dup v0.2d, {x}",
+                "add v0.2d, v0.2d, v0.2d",
+                "eor v0.16b, v0.16b, v0.16b",
+                "umov {x}, v0.d[0]",
+                "add {x}, {x}, #1",
+                x = inout(reg) acc,
+                out("v0") _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+    acc
+}
+
+/// AES round loop on the crypto extension.
+///
+/// Like its x86 counterpart this times `AESE`/`AESMC` latency; it is not a
+/// cipher implementation.
+///
+/// # Safety
+/// Requires the ARMv8 AES extension.
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub unsafe fn kernel_aes(loops: usize) -> u64 {
+    let mut acc: u64 = 0x0F1E_2D3C_4B5A_6978;
+    for _ in 0..loops {
+        unsafe {
+            asm!(
+                "dup v0.2d, {x}",
+                "dup v1.2d, {x}",
+                "aese v0.16b, v1.16b",
+                "aesmc v0.16b, v0.16b",
+                "umov {x}, v0.d[0]",
+                "add {x}, {x}, #1",
+                x = inout(reg) acc,
+                out("v0") _, out("v1") _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+    acc
+}
+
+/// SHA-256 round loop on the crypto extension.
+///
+/// # Safety
+/// Requires the ARMv8 SHA2 extension.
+#[inline(never)]
+#[target_feature(enable = "sha2")]
+pub unsafe fn kernel_sha256(loops: usize) -> u64 {
+    let mut acc: u64 = 0x6A09_E667_BB67_AE85;
+    for _ in 0..loops {
+        unsafe {
+            asm!(
+                "dup v0.2d, {x}",
+                "mov v1.16b, v0.16b",
+                "mov v2.16b, v0.16b",
+                "sha256su0 v0.4s, v1.4s",
+                "sha256h q1, q2, v0.4s",
+                "umov {x}, v1.d[0]",
+                "add {x}, {x}, #1",
+                x = inout(reg) acc,
+                out("v0") _, out("v1") _, out("v2") _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+    acc
+}
+
+/// Polynomial multiply loop — the AArch64 GHASH datapath.
+///
+/// # Safety
+/// Requires the ARMv8 PMULL extension.
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub unsafe fn kernel_pmull(loops: usize) -> u64 {
+    let mut acc: u64 = 0x0123_4567_89AB_CDEF;
+    for _ in 0..loops {
+        unsafe {
+            asm!(
+                "dup v0.2d, {x}",
+                "dup v1.2d, {x}",
+                "pmull v2.1q, v0.1d, v1.1d",
+                "umov {x}, v2.d[0]",
+                "add {x}, {x}, #1",
+                x = inout(reg) acc,
+                out("v0") _, out("v1") _, out("v2") _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+    acc
+}

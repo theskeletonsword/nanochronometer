@@ -1,0 +1,12 @@
+[package]
+name = "nanochrono-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ISA, cryptographic and TLS benchmark kernels for NanoChronometer"
+
+[dependencies]
+nanochrono-core.workspace = true
+nanochrono-crypto.workspace = true

@@ -1,0 +1,50 @@
+[package]
+name = "nanochrono-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Timing core: architectural counter routes, inline-asm probes, calibration and NTP discipline"
+
+[features]
+default = ["std", "simd"]
+
+# The vector probes and kernels. On by default; off for a freestanding x86
+# build, where the target's ABI is soft-float and LLVM will not allocate an
+# XMM register at all. `-Ctarget-feature=-soft-float` appears to lift that but
+# is deprecated and slated to become a hard error (rust-lang/rust#116344), so
+# the feature is switched off instead of the ABI being overridden.
+simd = []
+# Off: the crate is `no_std` and keeps only what needs no operating system —
+# `arch`, `backend`, `simd`, `redundancy`. That subset is what
+# `nanochrono-baremetal` builds on, so a freestanding kernel runs the same
+# inline assembly as a hosted process.
+std = []
+
+[dependencies]
+
+# libc and windows-sys are only reachable from the `std` modules, but Cargo
+# resolves target dependencies before features, so they are pulled in either
+# way. They are unused in a `no_std` build and the linker drops them.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    # EnableThreadProfiling / ReadThreadProfilingData: the NTOSKRNL
+    # thread-profiling API this crate uses for the PMU.
+    "Win32_System_Performance_HardwareCounterProfiling",
+    # QueryThreadCycleTime, the always-available floor beneath it.
+    "Win32_System_WindowsProgramming",
+    # PERFORMANCE_DATA and the TIME_ZONE_ID_* constants.
+    "Win32_System_SystemServices",
+    "Win32_System_Time",
+    # RegOpenKeyExW / RegGetValueW: the hypervisor evidence Windows keeps in
+    # the registry, which is the only identification path on ARM64 Windows
+    # because there is no CPUID to ask.
+    "Win32_System_Registry",
+] }
