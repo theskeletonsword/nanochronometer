@@ -1,4 +1,4 @@
-# NanoChronometer 3.0
+# NanoChronometer
 
 Nanosecond-resolution stopwatch, precision clock and ISA microbenchmark
 toolkit, built directly on the architectural counters — `RDTSC`/`RDTSCP` on
