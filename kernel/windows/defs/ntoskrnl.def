@@ -1,0 +1,23 @@
+; NanoChronometer import library descriptor for ntoskrnl.exe.
+; Consumed by llvm-mingw `dlltool` to produce an import lib per architecture:
+;   dlltool -d defs/ntoskrnl.def -D ntoskrnl.exe -l build/imports/ntoskrnl-<arch>.a
+;
+; Exports are unmangled on both x86_64 and ARM64 Windows.
+
+LIBRARY ntoskrnl.exe
+
+EXPORTS
+    DbgPrintEx
+    ExAllocatePoolWithTag
+    ExFreePoolWithTag
+    IoCreateDevice
+    IoCreateSymbolicLink
+    IoDeleteDevice
+    IoDeleteSymbolicLink
+    RtlInitUnicodeString
+    KeBugCheck
+    KeIsHypervisorPresent
+    KeQueryPerformanceCounter
+    MmGetPhysicalAddress
+    MmMapIoSpace
+    MmUnmapIoSpace

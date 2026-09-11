@@ -192,6 +192,15 @@ enum BenchModeArg {
     Isa,
     Crypto,
     Tls,
+    /// The kernel's own crypto, through `AF_ALG`. Linux only, and not
+    /// offered as an argument at all elsewhere: `AF_ALG` is a Linux socket
+    /// family with no equivalent to point this at on Windows or macOS.
+    #[cfg(target_os = "linux")]
+    Kernel,
+    /// The same, measured inside the kernel by the optional module. Linux
+    /// only, for the same reason and more so — it is a Linux kernel module.
+    #[cfg(target_os = "linux")]
+    Ring0,
 }
 
 impl From<BenchModeArg> for BenchMode {
@@ -200,6 +209,10 @@ impl From<BenchModeArg> for BenchMode {
             BenchModeArg::Isa => BenchMode::CpuIsa,
             BenchModeArg::Crypto => BenchMode::Crypto,
             BenchModeArg::Tls => BenchMode::TlsHandshake,
+            #[cfg(target_os = "linux")]
+            BenchModeArg::Kernel => BenchMode::KernelCrypto,
+            #[cfg(target_os = "linux")]
+            BenchModeArg::Ring0 => BenchMode::KernelCryptoRing0,
         }
     }
 }
@@ -369,7 +382,7 @@ fn run_dispatch() -> Result<(), String> {
 }
 
 fn run_host_sync() -> Result<(), String> {
-    let sync = nanochrono_core::HostSync::read();
+    let sync = nanochrono_core::kvmclock::cached();
 
     println!(
         "paravirtual clocksource : {}",
@@ -401,10 +414,17 @@ fn run_host_sync() -> Result<(), String> {
 }
 
 fn run_hypervisor(no_timing: bool) -> Result<(), String> {
+    // `--no-timing` is the only reason to detect afresh: it deliberately
+    // skips the trap-cost probe, which the cached report has already paid
+    // for. Everything else comes from the process-wide cache, so a program
+    // that asks twice does not probe twice.
+    let cached = nanochrono_core::hypervisor::cached();
+    let report;
     let report = if no_timing {
-        HypervisorReport::detect_declared_only()
+        report = HypervisorReport::detect_declared_only();
+        &report
     } else {
-        HypervisorReport::detect()
+        cached
     };
     println!("{}", report.detailed());
     Ok(())
@@ -853,9 +873,14 @@ fn run_bench(chrono: &Chronometer, args: BenchArgs) -> Result<(), String> {
     let selected: Vec<BenchKernel> = if args.kernel.eq_ignore_ascii_case("all") {
         rows.into_iter().filter(|k| k.is_available()).collect()
     } else {
-        let wanted = rows
-            .into_iter()
-            .find(|k| k.name().eq_ignore_ascii_case(&args.kernel));
+        // Matched on the display name, and — for the kernel-crypto mode —
+        // on the algorithm's own name too. `--kernel sha256` is the obvious
+        // thing to type, and "SHA-256 (kernel)" is not.
+        let wanted = rows.into_iter().find(|k| {
+            k.name().eq_ignore_ascii_case(&args.kernel)
+                || matches!(k, BenchKernel::Kernel(a) | BenchKernel::Ring0(a)
+                    if a.algorithm().eq_ignore_ascii_case(&args.kernel))
+        });
         match wanted {
             Some(k) => vec![k],
             None => {
@@ -867,6 +892,24 @@ fn run_bench(chrono: &Chronometer, args: BenchArgs) -> Result<(), String> {
             }
         }
     };
+
+    // An empty selection is not success. `--kernel all` filters by
+    // availability, and a mode whose rows are all unavailable would otherwise
+    // print nothing at all and exit zero — which reads as "it ran and found
+    // nothing to say" rather than "this needs something you have not done".
+    if selected.is_empty() {
+        return Err(format!(
+            "no runnable kernels for mode {}: {}",
+            mode.name(),
+            if mode == BenchMode::KernelCryptoRing0 {
+                "the kernel module is not loaded. Build and insert it with \
+                 `cd kernel/linux && make load`, or use `--mode kernel` for the \
+                 ring-3 measurement, which needs nothing."
+            } else {
+                "nothing this machine offers matches it."
+            }
+        ));
+    }
 
     for kernel in selected {
         let config = BenchConfig {

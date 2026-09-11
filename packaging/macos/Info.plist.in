@@ -17,6 +17,13 @@
   <string>NanoChronometer</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+
+  <!-- Resources/NanoChronometer.icns, written at bundle time from
+       assets/nanochrono.ico. The extension is conventionally left off; macOS
+       appends it. Without this key the bundle gets the generic application
+       icon however good the file in Resources is. -->
+  <key>CFBundleIconFile</key>
+  <string>NanoChronometer</string>
   <key>CFBundleShortVersionString</key>
   <string>@VERSION@</string>
   <key>CFBundleVersion</key>

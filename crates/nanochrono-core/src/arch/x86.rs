@@ -154,7 +154,81 @@ pub fn rdtsc_mfence() -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// Whether this CPU implements `RDTSCP`.
+///
+/// `CPUID.80000001H:EDX[27]`, cached after the first call.
+///
+/// # Why this has to be asked
+///
+/// `RDTSCP` is not architectural the way `RDTSC` is. It arrived with Nehalem
+/// and Barcelona, and on anything older — Core 2, Athlon 64, and every part
+/// before them — it is an invalid opcode. Executing it there raises `#UD`:
+/// `SIGILL` in a hosted process, and in a freestanding kernel with no
+/// interrupt descriptor table, a triple fault and a reset.
+///
+/// That is not hypothetical. It is what this project did on a Core 2: the
+/// kernel booted, printed its CPU report, reached the first SIMD probe, and
+/// the machine reset on the instruction that was supposed to time it.
+#[inline]
+pub fn has_rdtscp() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    /// Nothing asked yet.
+    const UNKNOWN: u8 = 0;
+    const PRESENT: u8 = 1;
+    const ABSENT: u8 = 2;
+
+    static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    match STATE.load(Ordering::Relaxed) {
+        PRESENT => true,
+        ABSENT => false,
+        _ => {
+            // Two `CPUID`s once per process, then never again: the answer
+            // cannot change, and a relaxed load of a byte is free enough to
+            // sit in the timing path.
+            let present = cpuid(0x8000_0000, 0)[0] >= 0x8000_0001
+                && cpuid(0x8000_0001, 0)[3] & (1 << 27) != 0;
+            STATE.store(if present { PRESENT } else { ABSENT }, Ordering::Relaxed);
+            present
+        }
+    }
+}
+
+/// An interval-end counter read that works on every x86-64 part.
+///
+/// `RDTSCP` where it exists, because waiting for older instructions to retire
+/// is exactly what an interval end wants. Where it does not, `LFENCE` before
+/// `RDTSC` achieves the ordering that matters for a measurement — older
+/// instructions have completed before the counter is sampled — at the cost of
+/// the `TSC_AUX` value, which is why this returns no core id and
+/// [`rdtscp_lfence`] is still used where one is needed.
+#[inline(always)]
+pub fn tsc_end_portable() -> u64 {
+    if has_rdtscp() {
+        rdtscp_lfence().0
+    } else {
+        rdtsc_lfence()
+    }
+}
+
+/// `IA32_TSC_AUX`, or `None` on a CPU with no `RDTSCP` to read it with.
+///
+/// The core/socket id is how thread migration is detected mid-measurement. A
+/// part without `RDTSCP` cannot report it, and saying so is better than
+/// returning a zero that reads as "core 0".
+#[inline]
+pub fn tsc_aux_checked() -> Option<u32> {
+    has_rdtscp().then(|| rdtscp_lfence().1)
+}
+
 /// `RDTSCP` + `LFENCE`, returning the counter and `IA32_TSC_AUX`.
+///
+/// # Safety of use
+///
+/// Not `unsafe`, but not universally available either: `RDTSCP` is `#UD` on
+/// parts older than Nehalem and Barcelona. Call [`has_rdtscp`] first, or use
+/// [`tsc_end_portable`], which does.
 ///
 /// `RDTSCP` waits for older instructions to retire, so it is the interval
 /// *end* counterpart to [`rdtsc_lfence`]. `TSC_AUX` carries the core/socket id
@@ -183,15 +257,21 @@ pub fn tsc_start_serialising() -> u64 {
 /// `RDTSCP` followed by a `CPUID` drain: the legacy backend's interval end.
 #[inline(always)]
 pub fn tsc_end_serialising() -> u64 {
-    let (t, _) = rdtscp_lfence();
+    // Portable: `CPUID` serialises either way, and the read in front of it
+    // must not be an invalid opcode on a part that predates `RDTSCP`.
+    let t = tsc_end_portable();
     let _ = cpuid(0, 0);
     t
 }
 
 /// `IA32_TSC_AUX` alone — the core/socket id of the current thread.
+///
+/// Zero on a part with no `RDTSCP` to read it with, which is indistinguishable
+/// from core 0. Callers that need to tell those apart want
+/// [`tsc_aux_checked`].
 #[inline]
 pub fn tsc_aux() -> u32 {
-    rdtscp_lfence().1
+    tsc_aux_checked().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +349,7 @@ pub unsafe fn probe_load_cycles(ptr: *const u64) -> u64 {
         asm!("mov {v}, [{p}]", p = in(reg) ptr, v = out(reg) sink,
              options(nostack, preserves_flags, readonly));
     }
-    let (end, _) = rdtscp_lfence();
+    let end = tsc_end_portable();
     core::hint::black_box(sink);
     end.wrapping_sub(start)
 }
@@ -286,7 +366,7 @@ pub unsafe fn probe_store_cycles(ptr: *mut u64, value: u64) -> u64 {
              p = in(reg) ptr, v = in(reg) value as usize,
              options(nostack, preserves_flags));
     }
-    let (end, _) = rdtscp_lfence();
+    let end = tsc_end_portable();
     end.wrapping_sub(start)
 }
 
@@ -336,7 +416,7 @@ pub unsafe fn probe_branch_cycles(pattern: *const u8, count: usize) -> u64 {
             acc = acc.wrapping_mul(3);
         }
     }
-    let (end, _) = rdtscp_lfence();
+    let end = tsc_end_portable();
     core::hint::black_box(acc);
     end.wrapping_sub(start)
 }
@@ -356,7 +436,7 @@ pub unsafe fn probe_pointer_chase_cycles(first: *const *const u8, steps: usize) 
         }
         p = unsafe { *p } as *const *const u8;
     }
-    let (end, _) = rdtscp_lfence();
+    let end = tsc_end_portable();
     core::hint::black_box(p);
     end.wrapping_sub(start)
 }
@@ -369,7 +449,7 @@ pub fn probe_barrier_cycles(iterations: u32) -> u64 {
     for _ in 0..n {
         lfence();
     }
-    let (end, _) = rdtscp_lfence();
+    let end = tsc_end_portable();
     end.wrapping_sub(start)
 }
 
@@ -434,7 +514,7 @@ macro_rules! simd_family {
                         options(nostack, preserves_flags, readonly),
                     );
                 }
-                let (end, _) = rdtscp_lfence();
+                let end = tsc_end_portable();
                 end.wrapping_sub(start)
             }
 
@@ -457,7 +537,7 @@ macro_rules! simd_family {
                         options(nostack, preserves_flags),
                     );
                 }
-                let (end, _) = rdtscp_lfence();
+                let end = tsc_end_portable();
                 end.wrapping_sub(start)
             }
 

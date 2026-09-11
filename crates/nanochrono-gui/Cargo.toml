@@ -16,4 +16,17 @@ nanochrono-core.workspace = true
 nanochrono-crypto.workspace = true
 nanochrono-bench.workspace = true
 iced = { version = "0.13.1", features = ["canvas", "image", "tokio"] }
+# Declared directly, with the `ico` feature named, rather than relying on
+# whatever `iced` happens to enable on its own copy. It did not enable `ico`,
+# so `window::icon::from_file_data` could not decode the application icon and
+# the window ran with no icon at all — silently, because the call site
+# discarded the error. See `window_icon`.
+image = { version = "0.24", default-features = false, features = ["ico", "png"] }
 tokio = { version = "1.53.1", features = ["rt"] }
+
+# Windows takes its executable icon from a resource compiled into the binary,
+# not from anything at run time: without this the .exe shows the generic
+# application icon in Explorer, the task bar and Alt-Tab however good the
+# icon the window sets. Build-time only — nothing is linked from this crate.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

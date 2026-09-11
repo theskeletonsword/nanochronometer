@@ -31,6 +31,86 @@ only through a text file in /proc, so the boundary is clean. The module is
 optional: nothing in the toolkit requires it.
 
 --------------------------------------------------------------------------
+Reference sources for the bare-metal drivers
+--------------------------------------------------------------------------
+
+The bare-metal target (crates/nanochrono-baremetal) talks to hardware that
+has no portable interface: the 8042 keyboard controller, the Synopsys
+DesignWare I2C master Intel ships in its LPSS block, I2C-HID touchpads and
+keyboards, and xHCI. Two existing driver trees were consulted while writing
+those, and they are not consulted on the same terms.
+
+  FreeBSD                BSD-2-Clause and BSD-3-Clause
+                         The model. These licenses are permissive and are
+                         compatible with Apache-2.0 in this direction, so
+                         FreeBSD's register definitions, bit names and
+                         initialisation orders may be — and are —
+                         reproduced here. The files relied on:
+
+                           sys/dev/ichiic/ig4_reg.h        BSD-3-Clause
+                           sys/dev/ichiic/ig4_iic.c        BSD-3-Clause
+                             DragonFly BSD, by Matthew Dillon; ported to
+                             FreeBSD by Michael Gmelin. The DesignWare/LPSS
+                             I2C master: crates/nanochrono-baremetal/src/i2c.rs
+                           sys/dev/iicbus/iichid.c         BSD-2-Clause
+                             Marc Priggemeyer and Vladimir Kondratyev. The
+                             I2C-HID transport and its power/reset sequence:
+                             crates/nanochrono-baremetal/src/i2c_hid.rs
+                           sys/dev/hid/hid.c               BSD-2-Clause
+                             HID report descriptor parsing:
+                             crates/nanochrono-core/src/hid_report.rs
+                           sys/dev/usb/controller/xhcireg.h    BSD-2-Clause
+                           sys/dev/usb/controller/xhci_pci.c   BSD-2-Clause
+                             Hans Petter Selasky. xHCI register offsets, the
+                             scratchpad-count expression and the BIOS-to-OS
+                             semaphore handoff:
+                             crates/nanochrono-baremetal/src/xhci.rs
+                           sys/dev/atkbdc/atkbdc.c         BSD-3-Clause
+                             8042 controller command set and bring-up order:
+                             crates/nanochrono-baremetal/src/input.rs
+sys/dev/hwpmc/hwpmc_amd.c       BSD-2-Clause
+   sys/dev/hwpmc/hwpmc_amd.h       BSD-2-Clause
+     AMD performance-counter register addresses, the
+     (select, counter) MSR pairing, the counter width
+     and the enumeration order:
+     crates/nanochrono-baremetal/src/pmu.rs
+     The event-select encoding — the event number split
+     across bits 7:0 and 35:32, and the unit mask in
+     bits 15:8 — as amd_event_select in
+     crates/nanochrono-core/src/pmu_leaf.rs
+                           sys/dev/gpio/intel/intelgpio.c  BSD-2-Clause
+                           sys/dev/gpio/intel/intelgpio.h  BSD-2-Clause
+                           sys/dev/gpio/intel/adlngpio.c   BSD-2-Clause
+                           sys/dev/gpio/intel/tglhgpio.c   BSD-2-Clause
+                             Beckhoff Automation GmbH & Co. KG. The Intel GPIO
+                             pad register layout, the pin-to-pad arithmetic,
+                             and the Alder Lake and Tiger Lake H pad-group
+                             tables: crates/nanochrono-baremetal/src/gpio.rs
+
+                         Attribution is the condition these licenses attach,
+                         and this section is it. The BSD-3-Clause files add a
+                         no-endorsement clause: neither FreeBSD, DragonFly
+                         BSD, nor any of the authors above endorse this
+                         software.
+
+  Linux                  GPL-2.0
+                         Consulted, never imitated. GPL-2.0 is incompatible
+                         with Apache-2.0, so no Linux code, expression,
+                         constant spelling, or comment is reproduced in this
+                         project. drivers/hid/i2c-hid/ and drivers/usb/ were
+                         read only to cross-check facts about the hardware
+                         that the hardware documentation states independently
+                         — which registers exist, what a device does on
+                         reset. Facts are not copyrightable; the code that
+                         expresses them is, and none of it is here. Where
+                         Linux and FreeBSD solve the same problem, the
+                         FreeBSD form is the one that was written down.
+
+                         The exception is kernel/linux/, which is a Linux
+                         kernel module, is licensed accordingly, and is
+                         covered in its own section above.
+
+--------------------------------------------------------------------------
 Third-party components
 --------------------------------------------------------------------------
 
@@ -58,5 +138,15 @@ release layout.
   iced                  MIT
                         Desktop GUI only; not linked into the libraries, the
                         CLI, or any Android artifact.
+  image                 MIT OR Apache-2.0
+                        Desktop GUI only. Already present through iced; named
+                        directly so the ICO decoder is enabled explicitly
+                        rather than by whatever features another crate
+                        happened to turn on.
+  winresource           MIT
+                        Windows builds only, and build-time only: it invokes
+                        the resource compiler to put the application icon into
+                        the .exe. Nothing from it is linked into any binary,
+                        so it is not redistributed.
 
 Run `cargo tree --format "{p} {l}"` for the complete, version-exact list.

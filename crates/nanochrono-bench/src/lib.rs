@@ -41,6 +41,28 @@ pub enum BenchMode {
     Crypto,
     /// Full TLS handshakes against a remote host.
     TlsHandshake,
+    /// The Linux kernel's own crypto, reached from ring 3 through `AF_ALG`.
+    ///
+    /// A different question from [`BenchMode::Crypto`]. That one times code
+    /// compiled into this process; this one times the implementation the
+    /// kernel selected for this machine, which is often a driver userspace
+    /// does not have — `sha256-avx2`, `ctr-aes-vaes-avx2`, `sha256-ce`. The
+    /// syscall is included in the number on purpose: it is what using the
+    /// kernel's crypto from userspace actually costs.
+    KernelCrypto,
+    /// The same kernel crypto, measured *inside* the kernel by the optional
+    /// module in `kernel/linux/` — the one that already answers the
+    /// hypervisor question.
+    ///
+    /// The difference between this and [`BenchMode::KernelCrypto`] is the
+    /// cost of `AF_ALG`: the socket, the two context switches and the copy in
+    /// and out. Neither mode can state that on its own; subtracting them can,
+    /// which is the reason both exist.
+    ///
+    /// The only mode with a prerequisite outside this process. It reports
+    /// itself unavailable when the module is not loaded rather than failing,
+    /// because not having built a kernel module is the ordinary case.
+    KernelCryptoRing0,
 }
 
 impl BenchMode {
@@ -49,6 +71,8 @@ impl BenchMode {
             BenchMode::CpuIsa => "CPU ISA kernels",
             BenchMode::Crypto => "Crypto (rustls/ring)",
             BenchMode::TlsHandshake => "TLS handshake (rustls)",
+            BenchMode::KernelCrypto => "Linux crypto API (AF_ALG, ring 3)",
+            BenchMode::KernelCryptoRing0 => "Linux crypto API (kernel module, ring 0)",
         }
     }
 
@@ -58,6 +82,8 @@ impl BenchMode {
             BenchMode::CpuIsa => "Mode 1: CPU ISA kernels",
             BenchMode::Crypto => "Mode 2: Crypto (rustls/ring)",
             BenchMode::TlsHandshake => "Mode 3: TLS handshake (rustls)",
+            BenchMode::KernelCrypto => "Mode 4: Linux crypto API (ring 3)",
+            BenchMode::KernelCryptoRing0 => "Mode 5: Linux crypto API (ring 0)",
         }
     }
 
@@ -67,15 +93,65 @@ impl BenchMode {
     /// build where a mode could be "NOT LINKED". TLS needs a network, which
     /// cannot be established without trying, so it is reported as available
     /// and allowed to fail with a message.
-    pub const fn is_available(self) -> bool {
-        true
+    pub fn is_available(self) -> bool {
+        match self {
+            // The provider is compiled in, unlike the C build where a mode
+            // could be "NOT LINKED". TLS needs a network, which cannot be
+            // established without trying, so it is reported as available and
+            // allowed to fail with a message.
+            BenchMode::CpuIsa | BenchMode::Crypto | BenchMode::TlsHandshake => true,
+            // This one genuinely can be absent: `AF_ALG` is a kernel config
+            // option, it does not exist off Linux, and a container's seccomp
+            // filter can refuse the socket even where the kernel has it.
+            // Saying so is better than offering a mode that returns errors.
+            BenchMode::KernelCrypto => nanochrono_core::kcrypto::available(),
+            // The only mode whose prerequisite lives outside this process:
+            // the module has to be built and inserted. Absent is the ordinary
+            // case, so it is reported rather than treated as a fault.
+            BenchMode::KernelCryptoRing0 => nanochrono_core::kcrypto::Ring0::read().is_some(),
+        }
     }
 
+    /// The modes this build offers, in display order.
+    ///
+    /// Two of them are Linux's and only Linux's. `AF_ALG` is a Linux socket
+    /// family, and the ring-0 mode is a Linux kernel module — neither has an
+    /// equivalent on Windows or macOS, and neither could be made to have one.
+    /// So off Linux they are not listed at all rather than listed and greyed
+    /// out: a mode that can never run on this operating system is not an
+    /// unavailable feature, it is a feature that does not apply.
+    #[cfg(target_os = "linux")]
+    pub const ALL: &'static [BenchMode] = &[
+        BenchMode::CpuIsa,
+        BenchMode::Crypto,
+        BenchMode::TlsHandshake,
+        BenchMode::KernelCrypto,
+        BenchMode::KernelCryptoRing0,
+    ];
+
+    /// The three portable modes. See the Linux list above for what is missing
+    /// and why it is missing rather than disabled.
+    #[cfg(not(target_os = "linux"))]
     pub const ALL: &'static [BenchMode] = &[
         BenchMode::CpuIsa,
         BenchMode::Crypto,
         BenchMode::TlsHandshake,
     ];
+
+    /// Whether this mode exists on this operating system at all.
+    ///
+    /// Distinct from [`BenchMode::is_available`], which asks whether a mode
+    /// that *could* run here can run right now — no network, no module
+    /// loaded. This asks whether it is a mode on this platform in the first
+    /// place, and the answer never changes at run time.
+    pub const fn applies_to_this_platform(self) -> bool {
+        match self {
+            BenchMode::CpuIsa | BenchMode::Crypto | BenchMode::TlsHandshake => true,
+            BenchMode::KernelCrypto | BenchMode::KernelCryptoRing0 => {
+                cfg!(target_os = "linux")
+            }
+        }
+    }
 }
 
 /// One selectable row in the benchmark panel.
@@ -89,6 +165,108 @@ pub enum BenchKernel {
     Crypto(Algorithm),
     /// A TLS handshake against the configured host.
     Tls,
+    /// One algorithm through the kernel's crypto API, from ring 3.
+    Kernel(KernelAlgorithm),
+    /// The same algorithm, measured inside the kernel by the module.
+    Ring0(KernelAlgorithm),
+}
+
+/// The algorithms this asks the kernel for, by the kernel's own names.
+///
+/// Two types, not four. `AF_ALG` also carries AEAD, but an AEAD session
+/// negotiates its associated-data length and authentication size through the
+/// same control message as the data, and a benchmark that got either wrong
+/// would report a number for something other than what it named. A hash and a
+/// block cipher are enough to show what the kernel's drivers do, and both are
+/// simple enough to be certainly right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelAlgorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+    Sha3_256,
+    Crc32c,
+    AesCbc,
+    AesCtr,
+}
+
+impl KernelAlgorithm {
+    /// The name to bind an `AF_ALG` socket to. These are the kernel's
+    /// spellings, not ours: `cbc(aes)` is what `/proc/crypto` calls it.
+    pub const fn algorithm(self) -> &'static str {
+        match self {
+            KernelAlgorithm::Sha1 => "sha1",
+            KernelAlgorithm::Sha256 => "sha256",
+            KernelAlgorithm::Sha512 => "sha512",
+            KernelAlgorithm::Sha3_256 => "sha3-256",
+            KernelAlgorithm::Crc32c => "crc32c",
+            KernelAlgorithm::AesCbc => "cbc(aes)",
+            KernelAlgorithm::AesCtr => "ctr(aes)",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            KernelAlgorithm::Sha1 => "SHA-1",
+            KernelAlgorithm::Sha256 => "SHA-256",
+            KernelAlgorithm::Sha512 => "SHA-512",
+            KernelAlgorithm::Sha3_256 => "SHA3-256",
+            KernelAlgorithm::Crc32c => "CRC32C",
+            KernelAlgorithm::AesCbc => "AES-256-CBC",
+            KernelAlgorithm::AesCtr => "AES-256-CTR",
+        }
+    }
+
+    pub const fn is_hash(self) -> bool {
+        !matches!(self, KernelAlgorithm::AesCbc | KernelAlgorithm::AesCtr)
+    }
+
+    /// Digest length, for sizing the read buffer.
+    ///
+    /// A short read here is not an error the kernel reports — it just hands
+    /// back fewer bytes — so the buffer has to be right rather than roomy.
+    pub const fn digest_len(self) -> usize {
+        match self {
+            KernelAlgorithm::Sha1 => 20,
+            KernelAlgorithm::Sha256 | KernelAlgorithm::Sha3_256 => 32,
+            KernelAlgorithm::Sha512 => 64,
+            KernelAlgorithm::Crc32c => 4,
+            KernelAlgorithm::AesCbc | KernelAlgorithm::AesCtr => 0,
+        }
+    }
+
+    pub const ALL: &'static [KernelAlgorithm] = &[
+        KernelAlgorithm::Sha1,
+        KernelAlgorithm::Sha256,
+        KernelAlgorithm::Sha512,
+        KernelAlgorithm::Sha3_256,
+        KernelAlgorithm::Crc32c,
+        KernelAlgorithm::AesCbc,
+        KernelAlgorithm::AesCtr,
+    ];
+
+    /// The hashes, which are the algorithms both rings can measure.
+    ///
+    /// Mode 5 runs inside the kernel through `shash`, and a symmetric cipher
+    /// there needs a request object, scatterlists and a completion — so the
+    /// ciphers are ring 3 only. These five are the rows where the two modes
+    /// measure the same thing and can be subtracted.
+    pub const HASHES: &'static [KernelAlgorithm] = &[
+        KernelAlgorithm::Sha1,
+        KernelAlgorithm::Sha256,
+        KernelAlgorithm::Sha512,
+        KernelAlgorithm::Sha3_256,
+        KernelAlgorithm::Crc32c,
+    ];
+
+    /// Which implementation the kernel would use, from `/proc/crypto`.
+    ///
+    /// Worth showing next to the number: `sha256-avx2` and `sha256-generic`
+    /// are the same algorithm and a different measurement, and without this
+    /// the reader cannot tell which one they got.
+    pub fn driver(self) -> Option<nanochrono_core::kcrypto::Driver> {
+        nanochrono_core::kcrypto::driver_for(self.algorithm())
+    }
 }
 
 impl BenchKernel {
@@ -98,6 +276,8 @@ impl BenchKernel {
             BenchKernel::Isa(b) => b.name().to_uppercase(),
             BenchKernel::Crypto(a) => a.name().to_string(),
             BenchKernel::Tls => "TLS 1.3 handshake".to_string(),
+            BenchKernel::Kernel(a) => format!("{} (ring 3)", a.name()),
+            BenchKernel::Ring0(a) => format!("{} (ring 0)", a.name()),
         }
     }
 
@@ -106,6 +286,15 @@ impl BenchKernel {
         match self {
             BenchKernel::Scalar | BenchKernel::Crypto(_) | BenchKernel::Tls => true,
             BenchKernel::Isa(b) => b.is_available(),
+            // Available means the kernel offers this algorithm *and* the
+            // socket family can be opened. A kernel without `sha512` in its
+            // config is an ordinary kernel, not a broken one.
+            BenchKernel::Kernel(a) => nanochrono_core::kcrypto::available() && a.driver().is_some(),
+            // Offered only if the loaded module actually measured this one. A
+            // kernel built without an algorithm makes the module skip it, and
+            // a row that cannot produce a number should not be listed.
+            BenchKernel::Ring0(a) => nanochrono_core::kcrypto::Ring0::read()
+                .is_some_and(|report| report.timings.iter().any(|(n, _)| n == a.algorithm())),
         }
     }
 
@@ -115,6 +304,8 @@ impl BenchKernel {
             BenchKernel::Scalar | BenchKernel::Isa(_) => BenchMode::CpuIsa,
             BenchKernel::Crypto(_) => BenchMode::Crypto,
             BenchKernel::Tls => BenchMode::TlsHandshake,
+            BenchKernel::Kernel(_) => BenchMode::KernelCrypto,
+            BenchKernel::Ring0(_) => BenchMode::KernelCryptoRing0,
         }
     }
 
@@ -130,6 +321,17 @@ impl BenchKernel {
                 .map(BenchKernel::Crypto)
                 .collect(),
             BenchMode::TlsHandshake => vec![BenchKernel::Tls],
+            BenchMode::KernelCrypto => KernelAlgorithm::ALL
+                .iter()
+                .copied()
+                .map(BenchKernel::Kernel)
+                .collect(),
+            // Hashes only — see `KernelAlgorithm::HASHES`.
+            BenchMode::KernelCryptoRing0 => KernelAlgorithm::HASHES
+                .iter()
+                .copied()
+                .map(BenchKernel::Ring0)
+                .collect(),
         }
     }
 }
@@ -178,6 +380,57 @@ impl BenchProfile {
                 bytes_per_op: payload_bytes as f64,
                 loops: [1_500, 3_000, 4_500],
                 repeats: [1, 2, 3],
+            },
+            BenchKernel::Kernel(algorithm) => BenchProfile {
+                title: algorithm.name().to_string(),
+                description: match algorithm.driver() {
+                    Some(driver) => format!(
+                        "{} over a {} buffer through AF_ALG; the kernel selected `{}`{}",
+                        algorithm.algorithm(),
+                        format::format_bytes(payload_bytes as f64),
+                        driver.driver,
+                        if driver.looks_accelerated() {
+                            ", which names an accelerated path"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => format!(
+                        "{} over a {} buffer through AF_ALG",
+                        algorithm.algorithm(),
+                        format::format_bytes(payload_bytes as f64)
+                    ),
+                },
+                // Named as including the syscall, because it does. Comparing
+                // this against Mode 2 without saying so would read as "the
+                // kernel's AES is slower", when much of the difference is the
+                // two context switches it took to ask.
+                unit: "1 op = 1 kernel call over the payload, syscall included".to_string(),
+                ops_per_loop: 1.0,
+                bytes_per_op: payload_bytes as f64,
+                // An order of magnitude fewer than the in-process crypto:
+                // each iteration is a `sendmsg` and a `read`, so the same
+                // loop count would take ten times as long for no more signal.
+                loops: [400, 800, 1_200],
+                repeats: [1, 2, 3],
+            },
+            BenchKernel::Ring0(algorithm) => BenchProfile {
+                title: format!("{} (ring 0)", algorithm.name()),
+                description: format!(
+                    "{} over a {} buffer, measured inside the kernel by the module — \
+                     no socket, no syscall, no copy across the privilege boundary",
+                    algorithm.algorithm(),
+                    format::format_bytes(payload_bytes as f64)
+                ),
+                unit: "1 op = 1 in-kernel call over the payload".to_string(),
+                ops_per_loop: 1.0,
+                bytes_per_op: payload_bytes as f64,
+                // Not a schedule this process controls. The module takes its
+                // own best-of-N inside the kernel and publishes the result;
+                // a "pass" here is one read of that, which re-runs it. The
+                // real count is reported per pass from what the module says.
+                loops: [1, 1, 1],
+                repeats: [1, 1, 1],
             },
             BenchKernel::Tls => BenchProfile {
                 title: "TLS 1.3 handshake".to_string(),
@@ -290,7 +543,26 @@ impl Default for BenchConfig {
 pub fn run(chrono: &Chronometer, config: &BenchConfig) -> BenchReport {
     let kernel = config.kernel;
     if !kernel.is_available() {
-        return BenchReport::failed(kernel, config.mode, "NOT AVAILABLE on this CPU");
+        // The reason differs by mode, and saying the wrong one sends the
+        // reader after the wrong thing: an ISA kernel is missing because the
+        // CPU lacks it, while a ring-0 row is missing because a module has
+        // not been inserted, which has nothing to do with the CPU at all.
+        return BenchReport::failed(
+            kernel,
+            config.mode,
+            match config.mode {
+                BenchMode::KernelCryptoRing0 => {
+                    "NOT AVAILABLE: the kernel module is not loaded, or it did not \
+                     measure this algorithm. Build and insert kernel/linux/ with \
+                     `make load`, or use --mode kernel for the ring-3 measurement."
+                }
+                BenchMode::KernelCrypto => {
+                    "NOT AVAILABLE: this kernel does not offer the algorithm through \
+                     AF_ALG, or the socket family is unavailable here."
+                }
+                _ => "NOT AVAILABLE on this CPU",
+            },
+        );
     }
 
     let mut log = String::new();
@@ -298,6 +570,9 @@ pub fn run(chrono: &Chronometer, config: &BenchConfig) -> BenchReport {
 
     if kernel == BenchKernel::Tls {
         return run_tls(config, log);
+    }
+    if let BenchKernel::Ring0(algorithm) = kernel {
+        return run_ring0(chrono, config, algorithm, log);
     }
 
     let profile = BenchProfile::for_kernel(kernel, CRYPTO_PAYLOAD_BYTES);
@@ -423,6 +698,18 @@ enum Workload {
         buffer: Vec<u8>,
         nonce: [u8; NONCE_LEN],
     },
+    /// A kernel algorithm, held open across the whole run.
+    ///
+    /// The session is opened once rather than per iteration on purpose. Bind
+    /// and accept are setup, not work: including them would measure how fast
+    /// this machine can open sockets, which is a different and less
+    /// interesting question than how fast its kernel encrypts.
+    Kernel {
+        session: nanochrono_core::kcrypto::Session,
+        algorithm: KernelAlgorithm,
+        payload: Vec<u8>,
+        out: Vec<u8>,
+    },
 }
 
 impl Workload {
@@ -448,6 +735,33 @@ impl Workload {
                     nonce: [0u8; NONCE_LEN],
                 })
             }
+            BenchKernel::Kernel(algorithm) => {
+                let payload = payload();
+                let session = if algorithm.is_hash() {
+                    nanochrono_core::kcrypto::Session::hash(algorithm.algorithm())
+                } else {
+                    // A fixed key: this is a stopwatch input, not a secret.
+                    // See `kcrypto`'s module documentation.
+                    nanochrono_core::kcrypto::Session::skcipher(
+                        algorithm.algorithm(),
+                        &[0x42u8; 32],
+                    )
+                }
+                .map_err(|e| {
+                    format!(
+                        "could not open {} through AF_ALG: {e}",
+                        algorithm.algorithm()
+                    )
+                })?;
+                let out = vec![0u8; payload.len().max(algorithm.digest_len())];
+                Ok(Workload::Kernel {
+                    session,
+                    algorithm,
+                    payload,
+                    out,
+                })
+            }
+            BenchKernel::Ring0(_) => Err("ring 0 is measured by run_ring0".to_string()),
             BenchKernel::Tls => Err("TLS is measured by run_tls".to_string()),
         }
     }
@@ -494,6 +808,45 @@ impl Workload {
                 }
                 sink
             }
+            Workload::Kernel {
+                session,
+                algorithm,
+                payload,
+                out,
+            } => {
+                let mut sink = 0u64;
+                // A fixed IV, for the same reason as the fixed key: reusing
+                // one would be a real weakness in real use and is meaningless
+                // here, where the input is a constant buffer and the output
+                // is thrown away. Varying it per iteration would measure the
+                // IV setup rather than the cipher.
+                let iv = [0x24u8; 16];
+                for i in 0..loops {
+                    let produced = if algorithm.is_hash() {
+                        session.digest(payload, out)
+                    } else {
+                        session.encrypt(&iv, payload, out)
+                    };
+                    // A failure part-way through ends the run rather than
+                    // being counted as a fast iteration: the caller divides
+                    // by `loops`, so a silent early exit would report the
+                    // kernel as arbitrarily quick.
+                    let Ok(n) = produced else {
+                        break;
+                    };
+                    // Added, not XORed. The payload is constant, so a hash
+                    // produces the same digest every iteration — and XORing a
+                    // constant an even number of times cancels to zero. The
+                    // sink exists to keep the optimiser from deleting the
+                    // loop and to show the caller that work happened; one
+                    // that reads zero on every run does neither.
+                    if n >= 8 {
+                        let tail = u64::from_le_bytes(out[n - 8..n].try_into().unwrap());
+                        sink = sink.wrapping_add(tail ^ i as u64);
+                    }
+                }
+                sink
+            }
         }
     }
 }
@@ -522,6 +875,154 @@ fn scalar_kernel(loops: usize) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Reads what the kernel module measured, three times.
+///
+/// # Why this mode does not time a loop
+///
+/// Because the work happens on the other side of the privilege boundary, and
+/// timing it from here would measure the boundary. That is precisely the
+/// quantity the ring-3 mode already reports, and the reason this one exists
+/// is to report the *other* half: the primitive with none of the transport.
+///
+/// So the module does the measuring. Every read of its `/proc` file runs the
+/// algorithms again, in kernel, taking a best-of-N with the same counter this
+/// process reads — and publishes the cycle count. Three reads give three
+/// passes, and the spread between them is real pass-to-pass variance in the
+/// kernel's own timing, not variance in how long it took to ask.
+///
+/// The cycles are converted here rather than there: the module has no
+/// calibration of its own, and this process already knows the counter's rate.
+///
+/// # What the number means
+///
+/// Cycles for one digest of the module's payload, best of its rounds. Set
+/// beside the ring-3 row for the same algorithm, the difference is what
+/// `AF_ALG` costs — the socket, the two context switches, and the copy in and
+/// out.
+fn run_ring0(
+    chrono: &Chronometer,
+    config: &BenchConfig,
+    algorithm: KernelAlgorithm,
+    mut log: String,
+) -> BenchReport {
+    let kernel = config.kernel;
+    let profile = BenchProfile::for_kernel(kernel, CRYPTO_PAYLOAD_BYTES);
+    let _ = writeln!(log, "warmup: {}", profile.description);
+    let _ = writeln!(log, "unit: {}\n", profile.unit);
+
+    let mut passes = Vec::with_capacity(3);
+    for pass in 1..=3u32 {
+        let Some(report) = nanochrono_core::kcrypto::Ring0::read() else {
+            return BenchReport::failed(
+                kernel,
+                config.mode,
+                "the kernel module is not loaded; build and insert kernel/linux/                  (see its README), or use --mode kernel for the ring-3 measurement",
+            );
+        };
+        let Some((_, cycles)) = report
+            .timings
+            .iter()
+            .find(|(name, _)| name == algorithm.algorithm())
+        else {
+            return BenchReport::failed(
+                kernel,
+                config.mode,
+                format!(
+                    "the loaded module did not measure {}; this kernel may not                      provide it",
+                    algorithm.algorithm()
+                ),
+            );
+        };
+
+        // The module states the size it measured over. Using the constant
+        // here instead would silently report the wrong throughput the moment
+        // the two disagreed — an old module against a new build, say.
+        let bytes = report.payload_bytes as f64;
+        let cycles = *cycles;
+        let seconds = chrono.units_to_secs(cycles);
+
+        passes.push(PassResult {
+            pass,
+            repeats: 1,
+            // What the module actually did, not what this process asked for.
+            loops: report.rounds,
+            cycles,
+            seconds,
+            total_ops: 1.0,
+            total_bytes: bytes,
+            mops: if seconds > 0.0 {
+                1.0 / seconds / 1e6
+            } else {
+                0.0
+            },
+            cycles_per_op: cycles as f64,
+            ns_per_op: seconds * 1e9,
+            mib_per_second: if seconds > 0.0 {
+                bytes / seconds / (1024.0 * 1024.0)
+            } else {
+                0.0
+            },
+            // Nothing to keep alive: the work was done in the kernel, where
+            // this process's optimiser has no say. Reporting the cycle count
+            // makes the value visible rather than leaving a misleading zero.
+            sink: cycles,
+        });
+        write_pass(&mut log, &profile, passes.last().expect("just pushed"));
+    }
+
+    // The comparison this mode exists for, stated rather than left as an
+    // exercise. Only shown when the ring-3 side can be measured too.
+    if let Some(ring3) = ring3_cycles_per_op(algorithm) {
+        let ring0 = passes
+            .iter()
+            .map(|p| p.cycles_per_op)
+            .fold(f64::INFINITY, f64::min);
+        if ring0.is_finite() && ring0 > 0.0 && ring3 > ring0 {
+            let _ = writeln!(
+                log,
+                "\nAF_ALG overhead: ring 3 {ring3:.0} cyc/op vs ring 0 {ring0:.0} cyc/op \
+                 = {:.0} cycles ({:.1}x) spent crossing the boundary",
+                ring3 - ring0,
+                ring3 / ring0
+            );
+        }
+    }
+
+    let summary = summarise(kernel, config.mode, passes, None);
+    write_summary(&mut log, &profile, &summary);
+    let _ = writeln!(log, "\nstatus: completed successfully.");
+
+    BenchReport {
+        summary,
+        log,
+        error: None,
+    }
+}
+
+/// Times the same algorithm through `AF_ALG`, for the comparison line.
+///
+/// Best of a short run, so the two sides are compared the way each was
+/// measured: the module takes a minimum in kernel, and this takes one here.
+/// `None` when the ring-3 path cannot run, in which case the comparison is
+/// simply not printed rather than being printed against a guess.
+fn ring3_cycles_per_op(algorithm: KernelAlgorithm) -> Option<f64> {
+    let payload = payload();
+    let session = nanochrono_core::kcrypto::Session::hash(algorithm.algorithm()).ok()?;
+    let mut out = vec![0u8; algorithm.digest_len().max(64)];
+
+    let mut best = u64::MAX;
+    for _ in 0..32 {
+        let start = arch::counter_start();
+        let produced = session.digest(&payload, &mut out);
+        let elapsed = arch::counter_end().wrapping_sub(start);
+        produced.ok()?;
+        if elapsed != 0 && elapsed < best {
+            best = elapsed;
+        }
+    }
+    (best != u64::MAX).then_some(best as f64)
+}
+
 fn run_pass(
     chrono: &Chronometer,
     dispatcher: &Dispatcher,
@@ -632,6 +1133,32 @@ fn write_header(log: &mut String, chrono: &Chronometer, config: &BenchConfig) {
         chrono.counter_hz() as f64 / 1e6,
         features.invariant_counter
     );
+    // The ring-0 half, when the optional module is loaded. Shown next to the
+
+    // ring-3 numbers because the difference between them is the point: the
+
+    // same algorithm, once through a socket and once not, and the gap is what
+
+    // `AF_ALG` costs.
+
+    if let Some(ring0) = nanochrono_core::kcrypto::Ring0::read() {
+        let _ = writeln!(
+            log,
+            "ring 0 module: loaded; {} algorithm(s), best of {} over {}",
+            ring0.timings.len(),
+            ring0.rounds,
+            format::format_bytes(ring0.payload_bytes as f64)
+        );
+
+        for (name, cycles) in &ring0.timings {
+            let _ = writeln!(log, "  ring 0 {name}: {cycles} cycles/op");
+        }
+    } else {
+        let _ = writeln!(
+            log,
+            "ring 0 module: not loaded (optional; see kernel/linux/README.md)"
+        );
+    }
     let _ = writeln!(log, "crypto provider: {}", nanochrono_crypto::PROVIDER);
     let _ = writeln!(
         log,
@@ -812,6 +1339,105 @@ mod tests {
                 assert!(!p.description.is_empty());
                 assert!(p.loops.iter().all(|&l| l > 0));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    /// The offered modes must be exactly the ones that apply here.
+    ///
+    /// Modes 4 and 5 are Linux's: `AF_ALG` is a Linux socket family and the
+    /// ring-0 mode is a Linux kernel module. Neither has an equivalent on
+    /// Windows or macOS, so neither is *listed* there — a mode that can never
+    /// run on an operating system is not an unavailable feature, it is not a
+    /// feature of that system at all.
+    ///
+    /// Asserted rather than trusted to the `cfg` above it, because the list
+    /// and the predicate are two places that have to agree and nothing else
+    /// makes them.
+    #[test]
+    fn only_modes_that_apply_to_this_platform_are_offered() {
+        for mode in BenchMode::ALL {
+            assert!(
+                mode.applies_to_this_platform(),
+                "{} is offered here and does not apply to this platform",
+                mode.name()
+            );
+        }
+        let offered = BenchMode::ALL.len();
+        let applicable = [
+            BenchMode::CpuIsa,
+            BenchMode::Crypto,
+            BenchMode::TlsHandshake,
+            BenchMode::KernelCrypto,
+            BenchMode::KernelCryptoRing0,
+        ]
+        .iter()
+        .filter(|mode| mode.applies_to_this_platform())
+        .count();
+        assert_eq!(
+            offered, applicable,
+            "the offered list and the platform predicate disagree"
+        );
+    }
+
+    /// And the count is what each platform should see.
+    #[test]
+    fn the_platform_offers_the_expected_number_of_modes() {
+        let expected = if cfg!(target_os = "linux") { 5 } else { 3 };
+        assert_eq!(
+            BenchMode::ALL.len(),
+            expected,
+            "expected {expected} modes on this platform, got {:?}",
+            BenchMode::ALL.iter().map(|m| m.name()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Every row a mode offers must belong to that mode.
+    ///
+    /// Cheap, and it catches the copy-paste that puts a ring-3 row in the
+    /// ring-0 list — which would silently report one measurement under the
+    /// other's name.
+    #[test]
+    fn every_row_belongs_to_the_mode_that_lists_it() {
+        for mode in BenchMode::ALL {
+            for kernel in BenchKernel::rows_for(*mode) {
+                assert_eq!(
+                    kernel.mode(),
+                    *mode,
+                    "{} is listed under {} but belongs to {}",
+                    kernel.name(),
+                    mode.name(),
+                    kernel.mode().name()
+                );
+            }
+        }
+    }
+
+    /// The ring-0 mode measures hashes only, and every one of them has a
+    /// ring-3 row measuring the same algorithm — otherwise the two numbers
+    /// could not be subtracted, which is the whole point of having both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_ring0_row_has_a_ring3_counterpart() {
+        for kernel in BenchKernel::rows_for(BenchMode::KernelCryptoRing0) {
+            let BenchKernel::Ring0(algorithm) = kernel else {
+                panic!("{} is not a ring-0 row", kernel.name());
+            };
+            assert!(
+                algorithm.is_hash(),
+                "{} is not a hash; ring 0 measures shash only",
+                algorithm.name()
+            );
+            assert!(
+                BenchKernel::rows_for(BenchMode::KernelCrypto)
+                    .contains(&BenchKernel::Kernel(algorithm)),
+                "{} has no ring-3 counterpart to compare against",
+                algorithm.name()
+            );
         }
     }
 }

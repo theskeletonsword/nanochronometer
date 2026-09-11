@@ -419,6 +419,15 @@ pub struct KernelProbe {
     pub current_el: Option<u32>,
     /// Trap cost measured from ring 0, free of userspace scheduling noise.
     pub exit_cycles: Option<u64>,
+    /// The lineage the module named — `intel`, `amd`, `zhaoxin`, `centaur`.
+    ///
+    /// Read from ring 0, where `CPUID.0H` cannot have been filtered on the
+    /// way out the way a hypervisor can filter what a guest sees.
+    pub cpu_family: Option<String>,
+    /// The highest Centaur extended leaf the part answers, if it has the
+    /// range at all. Only the VIA/Centaur lineage and Zhaoxin do, so a value
+    /// here identifies the part even where the vendor string was overridden.
+    pub centaur_max_leaf: Option<u32>,
     /// The AArch64 vendor hypervisor UID, as the four words SMCCC returns.
     ///
     /// Only a hypervisor implements the vendor range at all, so an answer
@@ -896,6 +905,35 @@ impl HypervisorReport {
         let _ = writeln!(out, "hypervisor    : {}", self.hypervisor.name());
         let _ = writeln!(out, "confidence    : {}", self.confidence.name());
         let _ = writeln!(out, "timing impact : {}", self.timing_impact.name());
+
+        // The CPU's own vendor, distinct from any hypervisor's. Zhaoxin is
+        // why it earns a line: its parts are x86-64 out of VIA's Centaur
+        // lineage, they carry Intel-style architectural PMUs and VMX — so a
+        // guest on one answers `VMCALL` exactly like an Intel part, and the
+        // probe needs no special case — but Linux does not read their
+        // `CPUID.15H`/`16H` counter-rate leaves, and code that treats "not
+        // AMD" as "Intel" would read them and build every later measurement
+        // on the answer.
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            let vendor = crate::cpu::vendor();
+            let _ = writeln!(
+                out,
+                "cpu vendor    : {} ({})",
+                vendor.name(),
+                vendor.as_str()
+            );
+            let centaur = crate::cpu::centaur_max_leaf();
+            if centaur != 0 {
+                let _ = writeln!(out, "centaur leaves: up to {centaur:#x}");
+            }
+            if !vendor.states_a_trustworthy_tsc_rate() {
+                let _ = writeln!(
+                    out,
+                    "counter rate  : measured, not read from CPUID (not an Intel part)"
+                );
+            }
+        }
         if let Some(sig) = &self.signature {
             let _ = writeln!(out, "cpuid vendor  : {sig:?}");
         }
@@ -1019,7 +1057,9 @@ impl HypervisorReport {
         }
 
         // Host time synchronisation, which only means anything in a guest.
-        let sync = crate::kvmclock::HostSync::read();
+        // The cache, not a fresh read: this is a display function and a
+        // pairing costs a hypercall. See `kvmclock::HOST_QUERIES`.
+        let sync = crate::kvmclock::cached();
         if let Some(clocksource) = &sync.paravirtual_clocksource {
             let _ = writeln!(
                 out,
@@ -1034,6 +1074,17 @@ impl HypervisorReport {
                 pairing.host_ns, pairing.guest_realtime_ns
             );
         }
+        // The count, not a claim. A pairing is a hypercall out of this guest
+
+        // and into a host other tenants share, so it is taken once per process
+
+        // and applied as arithmetic afterwards — see `kvmclock::HOST_QUERIES`.
+
+        let _ = writeln!(
+            out,
+            "host queries  : {} (once per process; the offset is then arithmetic)",
+            crate::kvmclock::host_queries()
+        );
         if sync.paravirtual_clocksource.is_some() || sync.pairing.is_some() {
             let _ = writeln!(out, "                  {}", sync.advice());
         }
@@ -1381,6 +1432,12 @@ fn parse_kernel_report(text: &str) -> KernelProbe {
             "svm_available" => probe.svm_available = flag(),
             "current_el" => probe.current_el = value.parse().ok(),
             "exit_cycles" => probe.exit_cycles = value.parse().ok(),
+            "cpu_family" => probe.cpu_family = Some(value.to_string()),
+            "centaur_max_leaf" => {
+                probe.centaur_max_leaf = value
+                    .strip_prefix("0x")
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            }
             "hvc_vendor_uid" => {
                 let words: Vec<u32> = value
                     .split_whitespace()
@@ -1712,5 +1769,60 @@ hvc_vendor_uid=b66fb428 e911c52e 564bcaa9 743a004d
             assert!(!impact.advice().is_empty());
             assert!(!impact.name().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod zhaoxin_tests {
+    use super::*;
+
+    /// The module's Zhaoxin lines are read back.
+    ///
+    /// Ring 0 is where this reading is worth having: a hypervisor can filter
+    /// what `CPUID.0H` shows a guest, and the module reads it on the other
+    /// side of that.
+    #[test]
+    fn a_zhaoxin_module_report_parses() {
+        let probe = parse_kernel_report(
+            "version=3\n\
+             arch=x86\n\
+             cpu_vendor=  Shanghai  \n\
+             cpu_family=zhaoxin\n\
+             centaur_max_leaf=0xc0000004\n\
+             cpuid_hypervisor_bit=0\n\
+             vmx_available=1\n\
+             svm_available=0\n\
+             vmcall_ok=0\n\
+             vmmcall_ok=0\n",
+        );
+        assert_eq!(probe.cpu_family.as_deref(), Some("zhaoxin"));
+        assert_eq!(probe.centaur_max_leaf, Some(0xC000_0004));
+        // Zhaoxin virtualization is VMX-shaped, so VMX is the extension that
+        // should be reported present — and `VMCALL` is what a guest on one
+        // would answer, which is the path the probe already takes.
+        assert_eq!(probe.vmx_available, Some(true));
+        assert_eq!(probe.svm_available, Some(false));
+    }
+
+    /// An Intel report carries no Centaur range, and that is not a parse
+    /// failure — the key is simply absent.
+    #[test]
+    fn an_intel_report_has_no_centaur_range() {
+        let probe = parse_kernel_report("version=3\narch=x86\ncpu_family=intel\nvmcall_ok=1\n");
+        assert_eq!(probe.cpu_family.as_deref(), Some("intel"));
+        assert_eq!(probe.centaur_max_leaf, None);
+    }
+
+    /// A malformed leaf value is dropped rather than parsed as zero, which
+    /// would read as "the range exists and is empty".
+    #[test]
+    fn a_malformed_centaur_leaf_is_not_taken_as_zero() {
+        let probe = parse_kernel_report("centaur_max_leaf=not-a-number\n");
+        assert_eq!(probe.centaur_max_leaf, None);
+        let probe = parse_kernel_report("centaur_max_leaf=c0000004\n");
+        assert_eq!(
+            probe.centaur_max_leaf, None,
+            "the module writes this with an 0x prefix; anything else is not its output"
+        );
     }
 }

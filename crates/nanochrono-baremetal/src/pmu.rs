@@ -77,11 +77,98 @@ pub struct CorePmu {
     pub core_type: CoreType,
     /// Filled in by [`enable`](Self::enable); `None` until then.
     pub route: CounterRoute,
+    /// Which register interface this core's counters live behind.
+    ///
+    /// Decided from `CPUID.0H` before any MSR is touched — see [`PmuKind`].
+    pub kind: PmuKind,
+    /// Per-core bookkeeping: what each counter was programmed with.
+    ///
+    /// Kept because a counter is a piece of shared hardware and this is the
+    /// only record of what it currently means. Reading a counter that
+    /// something else reprogrammed gives a number that looks perfectly
+    /// reasonable and answers a different question, and the difference is
+    /// invisible without this.
+    pub slots: [Slot; MAX_TRACKED_COUNTERS],
+}
+
+/// Counters this tracks per core.
+///
+/// Eight covers Intel's eight general-purpose counters on a P-core and AMD's
+/// six; a part with more has the extras left unprogrammed rather than
+/// unrecorded.
+pub const MAX_TRACKED_COUNTERS: usize = 8;
+
+/// What one counter on this core is currently doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Slot {
+    /// The event select value written, or zero if the counter is not ours.
+    pub event: u64,
+    /// Whether this code programmed it, as opposed to finding it in use.
+    pub owned: bool,
 }
 
 // ---------------------------------------------------------------------------
 // x86-64
 // ---------------------------------------------------------------------------
+
+/// Which register interface this core's counters live behind.
+///
+/// # The dispatch, and why it is by vendor rather than by feature
+///
+/// A performance counter is not architectural the way `RDTSC` is. Intel's
+/// live behind `IA32_PERFEVTSEL0` at MSR `0x186`; AMD's behind
+/// `0xC0010000` or `0xC0010200`, in pairs, with a different bit layout and a
+/// different event encoding. There is no feature bit that says "the Intel
+/// MSRs are here" — `CPUID.0AH` describes Intel's architectural PMU and AMD
+/// answers it with zeros — so the only way to know which registers exist is
+/// to know who made the part.
+///
+/// Getting that wrong is not a wrong reading, it is a dead machine: `WRMSR`
+/// to an MSR the part does not implement raises `#GP`, and this kernel has no
+/// interrupt descriptor table to take it. So the vendor is read first, from
+/// `CPUID.0H`, and nothing touches an MSR until it is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmuKind {
+    /// Intel's architectural PMU, enumerated by `CPUID.0AH`.
+    ///
+    /// Shared with Zhaoxin and VIA/Centaur, which are not imitations of it:
+    /// Zhaoxin's own Linux driver reads `CPUID.0AH` and requires version 2,
+    /// the same interface at the same registers.
+    IntelArchitectural,
+    /// AMD's core counters at `0xC0010200`, in `(select, counter)` pairs.
+    ///
+    /// Six by default since Family 15h, and exactly as many as
+    /// `CPUID.80000022H:EBX[3:0]` states where that leaf exists.
+    AmdCore,
+    /// AMD's original four at `0xC0010000` / `0xC0010004`.
+    ///
+    /// Family 0Fh through 10h, and any part that does not report the
+    /// extended-counter feature bit.
+    AmdLegacy,
+    /// AArch64's PMU, behind `PMCR_EL0`, `PMCNTENSET_EL0` and `PMCCNTR_EL0`.
+    ///
+    /// These are system registers rather than MSRs, and the counter is
+    /// unprivileged where the x86 ones are not — but they are still per-core
+    /// hardware with the same owner problem, so they are tracked with the
+    /// same interface descriptor.
+    ArmSystemRegister,
+    /// A part whose counters this does not know how to reach. Nothing is
+    /// programmed and no measurement is reported — which is the only safe
+    /// answer, because the alternative is guessing at an MSR address.
+    Unknown,
+}
+
+impl PmuKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            PmuKind::IntelArchitectural => "intel architectural",
+            PmuKind::AmdCore => "amd core (0xc0010200)",
+            PmuKind::AmdLegacy => "amd k8 (0xc0010000)",
+            PmuKind::ArmSystemRegister => "arm64 system registers",
+            PmuKind::Unknown => "unknown",
+        }
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
@@ -89,6 +176,9 @@ mod x86 {
         classify_core, decode_pmu_leaf, mask_to_width, CorePmu, CoreType, CounterRoute, Reading,
     };
     use crate::arch::x86::{cpuid, rdmsr, rdpmc, wrmsr};
+    use nanochrono_core::cpu::Vendor;
+
+    use super::PmuKind;
 
     /// `IA32_FIXED_CTR_CTRL`. Four bits per fixed counter.
     const IA32_FIXED_CTR_CTRL: u32 = 0x38D;
@@ -104,6 +194,13 @@ mod x86 {
     /// `IA32_PERF_GLOBAL_OVF_CTRL` / `..._STATUS_RESET`, which clears any
     /// overflow the firmware left latched. A latched overflow can leave a
     /// counter frozen depending on the control settings.
+    ///
+    /// **Only implemented counter bits may be written.** The register is
+    /// mostly reserved, and `WRMSR` raises `#GP` on a reserved bit that is
+    /// set — which in a kernel with no IDT is a triple fault. An emulator
+    /// ignores the write; real silicon does not, and this was a live bug:
+    /// clearing it with `u64::MAX` worked under QEMU and killed the machine
+    /// on a laptop.
     const IA32_PERF_GLOBAL_OVF_CTRL: u32 = 0x390;
 
     /// `CPU_CLK_UNHALTED.THREAD` as a general-purpose event.
@@ -141,20 +238,260 @@ mod x86 {
     }
 
     /// Describes the PMU of the core this runs on.
+    /// Describes this core's PMU, dispatching on the vendor before anything
+    /// is touched.
+    ///
+    /// The order is deliberate and is the whole safety argument:
+    ///
+    /// 1. `CPUID.0H` for the vendor string. Reading CPUID is safe anywhere.
+    /// 2. From the vendor, which register interface exists — see [`PmuKind`].
+    /// 3. Only then the enumeration leaf, which differs per interface.
+    ///
+    /// Nothing writes an MSR here. A `WRMSR` to a register the part does not
+    /// implement is `#GP`, and with no interrupt descriptor table that is a
+    /// triple fault; so the address space is established before it is used,
+    /// rather than probed by trying.
     pub(super) fn detect() -> CorePmu {
         let core_type = core_type();
-        if cpuid(0, 0)[0] < 0x0A {
-            return CorePmu {
-                leaf: Default::default(),
-                core_type,
-                route: CounterRoute::None,
-            };
-        }
-        let [eax, ebx, _ecx, edx] = cpuid(0x0A, 0);
+        let vendor = nanochrono_core::cpu::vendor();
+
+        let (kind, leaf) = match vendor {
+            // Intel's architectural PMU, and the two vendors that implement
+            // the same interface rather than an imitation of it.
+            Vendor::Intel | Vendor::Zhaoxin | Vendor::Centaur => {
+                if cpuid(0, 0)[0] < 0x0A {
+                    (PmuKind::Unknown, Default::default())
+                } else {
+                    let [eax, ebx, _ecx, edx] = cpuid(0x0A, 0);
+                    (PmuKind::IntelArchitectural, decode_pmu_leaf(eax, ebx, edx))
+                }
+            }
+            Vendor::Amd => amd::detect(),
+            Vendor::Other(_) => (PmuKind::Unknown, Default::default()),
+        };
+
         CorePmu {
-            leaf: decode_pmu_leaf(eax, ebx, edx),
+            leaf,
             core_type,
             route: CounterRoute::None,
+            kind,
+            slots: [Default::default(); super::MAX_TRACKED_COUNTERS],
+        }
+    }
+
+    /// AMD's core performance counters.
+    ///
+    /// # Reference
+    ///
+    /// Register addresses, the `(select, counter)` pairing, the counter
+    /// widths and the enumeration order follow FreeBSD's
+    /// `sys/dev/hwpmc/hwpmc_amd.c` and `hwpmc_amd.h`, which are BSD-2-Clause
+    /// and whose terms ask for attribution in return; see `NOTICE`. The event
+    /// numbers are from AMD's own BIOS and Kernel Developer's Guide,
+    /// publication 32559.
+    pub(in crate::pmu) mod amd {
+        use super::{cpuid, rdmsr, wrmsr, PmuKind};
+        use nanochrono_core::pmu_leaf::{amd_event_select, PmuLeaf};
+
+        /// The original four counters. Family 0Fh through 10h.
+        const K8_EVSEL_0: u32 = 0xC001_0000;
+        const K8_PERFCTR_0: u32 = 0xC001_0004;
+        const K8_COUNTERS: u8 = 4;
+
+        /// The extended set, in `(select, counter)` pairs two MSRs apart:
+        /// select `n` at `BASE + 2n`, counter `n` at `BASE + 2n + 1`.
+        const CORE_BASE: u32 = 0xC001_0200;
+        /// Six since Family 15h, unless `CPUID.80000022H` says otherwise.
+        const CORE_DEFAULT: u8 = 6;
+
+        /// `CPUID.80000001H:ECX[23]`, PerfCtrExtCore: the extended counters
+        /// exist. FreeBSD calls this `AMDID2_PCXC`.
+        const PERFCTR_EXT_CORE: u32 = 1 << 23;
+
+        /// `CPUID.80000022H`, which states the counts exactly where it
+        /// exists. `EBX[3:0]` is the number of core counters.
+        const EXT_PERFMON_LEAF: u32 = 0x8000_0022;
+
+        /// AMD counters are 48 bits wide, on both interfaces.
+        const COUNTER_WIDTH: u8 = 48;
+
+        /// Event select bits. The layout is AMD's, not Intel's: the enable
+        /// bit is 22 rather than 22-with-different-neighbours, and the event
+        /// number is split across bits 7:0 and 35:32.
+        const EVSEL_USR: u64 = 1 << 16;
+        const EVSEL_OS: u64 = 1 << 17;
+        const EVSEL_ENABLE: u64 = 1 << 22;
+
+        /// `CPU Clocks not Halted`, event `0x76`. AMD BKDG 32559, §11.2.1.6.
+        const EVENT_CYCLES: u16 = 0x76;
+        /// `Retired Instructions`, event `0xC0`. AMD BKDG 32559, §11.2.1.6.
+        /// The K8 family calls it `Retired x86 Instructions`; Family 10h and
+        /// later use the same code for the same event. This is the number
+        /// FreeBSD's `amd_event_codes` maps `PMC_EV_K8_FR_RETIRED_X86_INSTRUCTIONS`
+        /// to, identical on every AMD core family back to K8.
+        const EVENT_INSTRUCTIONS: u16 = 0xC0;
+
+        /// What this core's counters are and where they live.
+        pub(in crate::pmu) fn detect() -> (PmuKind, PmuLeaf) {
+            // The extended leaf states the count exactly. Preferred over the
+            // feature bit's default, which is only a default.
+            let extended = cpuid(0x8000_0000, 0)[0] >= EXT_PERFMON_LEAF;
+            let stated = if extended {
+                (cpuid(EXT_PERFMON_LEAF, 0)[1] & 0x0F) as u8
+            } else {
+                0
+            };
+
+            let has_ext_core = cpuid(0x8000_0000, 0)[0] >= 0x8000_0001
+                && cpuid(0x8000_0001, 0)[2] & PERFCTR_EXT_CORE != 0;
+
+            let (kind, counters) = if has_ext_core {
+                (
+                    PmuKind::AmdCore,
+                    if stated != 0 { stated } else { CORE_DEFAULT },
+                )
+            } else if cpuid(0x8000_0000, 0)[0] >= 0x8000_0001 {
+                (PmuKind::AmdLegacy, K8_COUNTERS)
+            } else {
+                // No extended CPUID at all: not an x86-64 AMD this knows.
+                return (PmuKind::Unknown, PmuLeaf::default());
+            };
+
+            (
+                kind,
+                PmuLeaf {
+                    // AMD has no architectural-PMU version; one is the
+                    // honest answer for "counters exist and are readable".
+                    version: 1,
+                    general_counters: counters.min(super::super::MAX_TRACKED_COUNTERS as u8),
+                    general_width: COUNTER_WIDTH,
+                    // No fixed counters: every AMD counter is programmable.
+                    fixed_counters: 0,
+                    fixed_width: 0,
+                    ..PmuLeaf::default()
+                },
+            )
+        }
+
+        /// The `(select, counter)` MSR pair for counter `index`.
+        fn msrs(kind: PmuKind, index: u32) -> Option<(u32, u32)> {
+            match kind {
+                PmuKind::AmdCore => Some((CORE_BASE + 2 * index, CORE_BASE + 2 * index + 1)),
+                PmuKind::AmdLegacy => Some((K8_EVSEL_0 + index, K8_PERFCTR_0 + index)),
+                _ => None,
+            }
+        }
+
+        /// Programmes counter zero to count unhalted core cycles.
+        ///
+        /// Returns the counter index on success. Nothing is written unless
+        /// the interface was identified, so a part this does not recognise
+        /// leaves its MSRs alone.
+        ///
+        /// # Safety
+        /// Writes MSRs; requires CPL 0 and an AMD part.
+        pub(in crate::pmu) unsafe fn enable_cycles(
+            kind: PmuKind,
+            counters: u8,
+        ) -> Option<(u32, u64)> {
+            // SAFETY: forwarded from this function's own contract.
+            unsafe { enable_general(kind, counters, 0, EVENT_CYCLES) }
+        }
+
+        /// Programmes counter one to count retired instructions.
+        ///
+        /// Only when a second counter exists — the K8 group always has four,
+        /// and nothing with a core counter ever has one, but the leaf owns
+        /// the truth and a counter this did not check for is an MSR this
+        /// would not touch.
+        ///
+        /// # Safety
+        /// Writes MSRs; requires CPL 0 and an AMD part.
+        pub(in crate::pmu) unsafe fn enable_instructions(
+            kind: PmuKind,
+            counters: u8,
+        ) -> Option<(u32, u64)> {
+            // SAFETY: forwarded from this function's own contract.
+            unsafe { enable_general(kind, counters, 1, EVENT_INSTRUCTIONS) }
+        }
+
+        /// Programmes counter `index` with an event, if the interface was
+        /// identified and the counter exists.
+        ///
+        /// The event number goes through [`amd_event_select`] because AMD
+        /// splits it across bits 7:0 and 35:32; a byte that just happened to
+        /// fit would stop being correct the day an event above `0xFF` is
+        /// used. Counting is enabled for both privilege levels (`USR | OS`),
+        /// so the count does not depend on where the caller runs, and no
+        /// interrupt is raised on overflow — there is no handler for one.
+        ///
+        /// # Safety
+        /// Writes MSRs; requires CPL 0 and an AMD part.
+        unsafe fn enable_general(
+            kind: PmuKind,
+            counters: u8,
+            index: u32,
+            event_code: u16,
+        ) -> Option<(u32, u64)> {
+            if index >= counters as u32 {
+                return None;
+            }
+            let (evsel, perfctr) = msrs(kind, index)?;
+            let event = amd_event_select(event_code, 0) | EVSEL_USR | EVSEL_OS | EVSEL_ENABLE;
+
+            // SAFETY: the addresses come from `msrs`, which only answers for
+            // an interface `detect` positively identified, and the counter
+            // index was bounds-checked against the leaf above. Order
+            // matters: the counter is zeroed while the select is still
+            // disabled, so it cannot count between the two writes.
+            unsafe {
+                wrmsr(evsel, 0);
+                wrmsr(perfctr, 0);
+                wrmsr(evsel, event);
+            }
+            Some((index, event))
+        }
+
+        /// Reads counter `index`, sign-extended from its 48 bits.
+        ///
+        /// # Safety
+        /// Reads an MSR; requires CPL 0 and an AMD part.
+        pub(in crate::pmu) unsafe fn read(kind: PmuKind, index: u32) -> Option<u64> {
+            let (_, perfctr) = msrs(kind, index)?;
+            // SAFETY: as above.
+            let raw = unsafe { rdmsr(perfctr) };
+            // The counter is 48 bits and the upper bits read as whatever the
+            // part leaves there. Masking rather than sign-extending, because
+            // this is a monotonically increasing count and a difference of
+            // two masked reads is correct across a wrap.
+            Some(raw & ((1u64 << COUNTER_WIDTH) - 1))
+        }
+    }
+
+    /// Sets `CR4.PCE`, which permits `RDPMC` outside ring 0.
+    ///
+    /// Not required by anything here, and said plainly rather than implied:
+    /// the SDM's pseudocode for `RDPMC` is
+    ///
+    /// ```text
+    /// IF (((CR4.PCE = 1) or (CPL = 0) or (CR0.PE = 0)) and (ECX indicates a supported counter))
+    /// ```
+    ///
+    /// — so at CPL 0, which this kernel never leaves, the flag is irrelevant.
+    /// It is set anyway because it costs one `MOV` pair, because it makes the
+    /// intent explicit, and because the moment anything here runs at CPL 3
+    /// its absence would be a fault with no obvious cause.
+    ///
+    /// # Safety
+    /// Writes `CR4`; requires CPL 0.
+    pub(super) unsafe fn enable_rdpmc_outside_ring0() {
+        // SAFETY: `CR4.PCE` is bit 8 on every x86-64 part; setting a defined
+        // bit and preserving the rest cannot fault.
+        unsafe {
+            let mut cr4: u64;
+            core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            cr4 |= 1 << 8;
+            core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
         }
     }
 
@@ -190,10 +527,26 @@ mod x86 {
         unsafe {
             wrmsr(IA32_PMC0, 0);
             wrmsr(IA32_PERFEVTSEL0, select);
-            let global = rdmsr(IA32_PERF_GLOBAL_CTRL);
+            // Only counter 0, and only bits this core implements.
+            let global = rdmsr(IA32_PERF_GLOBAL_CTRL) & implemented_mask(pmu);
             wrmsr(IA32_PERF_GLOBAL_CTRL, global | 1);
         }
         Some(0)
+    }
+
+    /// Which bits of `IA32_PERF_GLOBAL_CTRL` this core actually implements.
+    ///
+    /// Everything else in the register is reserved, and carrying a stale
+    /// reserved bit through a read-modify-write is `#GP` on the write.
+    fn implemented_mask(pmu: &CorePmu) -> u64 {
+        let mut mask = 0u64;
+        for i in 0..pmu.leaf.general_counters.min(32) as u32 {
+            mask |= 1u64 << i;
+        }
+        for i in 0..pmu.leaf.fixed_counters.min(3) as u32 {
+            mask |= 1u64 << (32 + i);
+        }
+        mask
     }
 
     /// Reads a general-purpose counter, masked to its width.
@@ -204,6 +557,11 @@ mod x86 {
         if index >= pmu.leaf.general_counters as u32 {
             return None;
         }
+        // `RDPMC` rather than `RDMSR`, and it is vendor-neutral here: on
+        // Intel index `n` selects general counter `n`, and on AMD indices 0
+        // upward select the core counters in the same order. The width mask
+        // is what differs — 48 bits on AMD, whatever `CPUID.0AH` stated on
+        // Intel — and that comes from the leaf rather than from an assumption.
         // SAFETY: caller guarantees the privilege level; the index was
         // bounds-checked against what this core reports.
         let raw = unsafe { rdpmc(index) };
@@ -242,13 +600,31 @@ mod x86 {
         unsafe {
             // Firmware can leave an overflow latched, which depending on the
             // control settings leaves the counter frozen and reading the same
-            // value forever. Clearing it costs one write.
-            wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, u64::MAX);
+            // value forever. Cleared by writing a one to each counter's own
+            // bit — general counters low, fixed counters from bit 32 — and
+            // nothing else, because every other bit in this register is
+            // reserved and setting one is `#GP`.
+            let mut overflow = 0u64;
+            for i in 0..pmu.leaf.general_counters.min(32) as u32 {
+                overflow |= 1u64 << i;
+            }
+            for i in 0..pmu.leaf.fixed_counters.min(3) as u32 {
+                overflow |= 1u64 << (32 + i);
+            }
+            wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, overflow);
             wrmsr(IA32_FIXED_CTR_CTRL, ctrl);
 
             // Enabling in the global control register is what actually starts
             // them; the per-counter bits above only say how to count.
-            let mut global = rdmsr(IA32_PERF_GLOBAL_CTRL);
+            //
+            // Built from what this core reports rather than OR-ed into
+            // whatever was already there: the register's upper bits are
+            // reserved, and preserving a stale one would be `#GP` on the
+            // write for the same reason as above.
+            let mut global = 0u64;
+            for i in 0..pmu.leaf.general_counters.min(32) as u32 {
+                global |= 1u64 << i;
+            }
             for i in 0..pmu.leaf.fixed_counters.min(3) as u32 {
                 global |= 1u64 << (32 + i);
             }
@@ -307,7 +683,7 @@ mod x86 {
 
 #[cfg(target_arch = "aarch64")]
 mod arm {
-    use super::{CorePmu, CoreType, CounterRoute, PmuLeaf, Reading};
+    use super::{CorePmu, CoreType, CounterRoute, PmuKind, PmuLeaf, Reading};
     use crate::arch::aarch64 as a;
 
     /// `PMCNTENSET_EL0` bit 31 enables the dedicated cycle counter.
@@ -355,6 +731,8 @@ mod arm {
             },
             core_type: core_type(),
             route: CounterRoute::None,
+            kind: PmuKind::ArmSystemRegister,
+            slots: [Default::default(); super::MAX_TRACKED_COUNTERS],
         }
     }
 
@@ -464,6 +842,24 @@ impl CorePmu {
         }
     }
 
+    /// Records what a counter was programmed with.
+    ///
+    /// The per-core state the measurement depends on. A counter is shared
+    /// hardware: something else — firmware, a hypervisor, a later call here —
+    /// can reprogram it, and a read afterwards returns a number that looks
+    /// entirely reasonable while answering a different question. This is the
+    /// only record of what the number currently means.
+    pub fn record(&mut self, index: usize, event: u64) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            *slot = Slot { event, owned: true };
+        }
+    }
+
+    /// What a counter is currently programmed with, if this programmed it.
+    pub fn slot(&self, index: usize) -> Option<Slot> {
+        self.slots.get(index).copied().filter(|slot| slot.owned)
+    }
+
     /// Whether this core has a usable PMU.
     pub fn is_available(&self) -> bool {
         self.leaf.is_available()
@@ -491,6 +887,66 @@ impl CorePmu {
     pub unsafe fn enable(&mut self) -> CounterRoute {
         #[cfg(target_arch = "x86_64")]
         {
+            // Permit `RDPMC` outside ring 0. Not needed here — see the
+            // function — but set before anything else so the state is
+            // established rather than assumed.
+            // SAFETY: forwarded from this function's own contract.
+            unsafe { x86::enable_rdpmc_outside_ring0() };
+
+            match self.kind {
+                // AMD has no fixed counters: every one is programmable, so
+                // there is no architectural route to try first.
+                PmuKind::AmdCore | PmuKind::AmdLegacy => {
+                    // SAFETY: as above; `enable_cycles` writes only the MSRs
+                    // its own interface defines.
+                    if let Some((index, event)) =
+                        unsafe { x86::amd::enable_cycles(self.kind, self.leaf.general_counters) }
+                    {
+                        self.record(index as usize, event);
+                        let route = CounterRoute::General(index);
+                        // SAFETY: as above; reads only. The read goes through
+                        // `RDMSR`, not `RDPMC` — see `read_route`.
+                        if unsafe { self.counter_advances(route) } {
+                            // The measurement route is settled; instructions
+                            // ride a second counter when one exists. It is
+                            // verified the same way the cycle counter was —
+                            // a counter a virtualizer or firmware left frozen
+                            // reports a fixed number, which is precisely what
+                            // the report must not show — and only recorded
+                            // when it moves. Failing here loses a line of the
+                            // report, never the measurement.
+                            // SAFETY: as above; same interface, counter 1.
+                            if let Some((index, event)) = unsafe {
+                                x86::amd::enable_instructions(
+                                    self.kind,
+                                    self.leaf.general_counters,
+                                )
+                            } {
+                                // SAFETY: as above; reads only, via MSR.
+                                if unsafe { self.counter_advances(CounterRoute::General(index)) } {
+                                    self.record(index as usize, event);
+                                }
+                            }
+                            self.route = route;
+                            return route;
+                        }
+                    }
+                    self.route = CounterRoute::None;
+                    return self.route;
+                }
+                PmuKind::Unknown | PmuKind::ArmSystemRegister => {
+                    // Nothing is known about this part's counters, so nothing
+                    // is written to them. A wrong MSR here is a triple fault,
+                    // not a wrong number. (`ArmSystemRegister` cannot reach
+                    // this match arm on x86-64, which is the architecture
+                    // this block compiles for; it is listed so the match is
+                    // total.)
+                    self.route = CounterRoute::None;
+                    return self.route;
+                }
+                PmuKind::IntelArchitectural => {}
+            }
+
             // SAFETY: forwarded from this function's own contract.
             unsafe { x86::enable_fixed(self) };
             // SAFETY: as above; reads only.
@@ -578,6 +1034,56 @@ impl CorePmu {
         unsafe { self.read_route(self.route) }
     }
 
+    /// Reads the instructions-retired count, from whatever counted it.
+    ///
+    /// On Intel this is fixed counter 0, so it is only present on the
+    /// `Fixed` route. On AMD, where every counter is programmable, it is the
+    /// general-purpose counter [`enable`](Self::enable) programmed with
+    /// `Retired Instructions` (`0xC0`) when a second one existed — and it is
+    /// [recorded](Self::record), so a counter that another writer reprogrammed
+    /// is refused here rather than misread. `None` means there is no
+    /// instructions counter to read, which is a fact about the machine, not
+    /// an error.
+    ///
+    /// # Safety
+    /// Requires ring 0 / EL1.
+    pub unsafe fn read_instructions(&self) -> Option<Reading> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            match self.kind {
+                // SAFETY: as above; `read` checks the counter exists.
+                PmuKind::AmdCore | PmuKind::AmdLegacy => {
+                    // The pairing is fixed by `enable`: cycles on counter 0,
+                    // instructions on counter 1. A slot that is not `owned`
+                    // means the programming never happened (or happened and
+                    // lost the MSRs to someone else), and the number it would
+                    // return is not this measurement's — so refuse.
+                    if self.slots[1].owned {
+                        // SAFETY: forwarded from this function's own contract.
+                        unsafe { x86::amd::read(self.kind, 1) }.map(|value| Reading {
+                            value,
+                            core_type: self.core_type,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    // SAFETY: as above.
+                    unsafe { self.read(FIXED_INSTRUCTIONS) }
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AArch64's one fixed counter counts cycles, not instructions;
+            // a general event counter would need PMCEID1_EL0 to choose an
+            // instruction event, which this driver does not program.
+            let _ = self;
+            None
+        }
+    }
+
     /// # Safety
     /// Requires ring 0 / EL1.
     unsafe fn read_route(&self, route: CounterRoute) -> Option<Reading> {
@@ -585,9 +1091,34 @@ impl CorePmu {
             CounterRoute::None => None,
             // SAFETY: forwarded from this function's own contract.
             CounterRoute::Fixed => unsafe { self.read(FIXED_CORE_CYCLES) },
+            // The read instruction depends on the interface, and the choice
+            // is not an optimisation.
+            //
+            // `RDPMC` takes a counter index and is one instruction; `RDMSR`
+            // takes an address and is slower. But `RDPMC` is *optional* in a
+            // way that is invisible until it faults: QEMU's TCG raises `#UD`
+            // for it unconditionally, and a hypervisor may decline it too.
+            // On Intel that never surfaced because a machine without a real
+            // PMU reports `CPUID.0AH` version 0 and never reaches a read. On
+            // AMD the counters are enumerated from a feature bit that TCG
+            // *does* advertise, so the first read was an invalid opcode and,
+            // with no interrupt descriptor table, a reset.
+            //
+            // So AMD reads through the MSR it just wrote — which is
+            // necessarily implemented wherever the write was — and Intel
+            // keeps `RDPMC`, where the enumeration already proves a real PMU.
             #[cfg(target_arch = "x86_64")]
-            // SAFETY: as above.
-            CounterRoute::General(i) => unsafe { x86::read_general(self, i) },
+            CounterRoute::General(i) => match self.kind {
+                // SAFETY: as above.
+                PmuKind::AmdCore | PmuKind::AmdLegacy => unsafe {
+                    x86::amd::read(self.kind, i).map(|value| Reading {
+                        value,
+                        core_type: self.core_type,
+                    })
+                },
+                // SAFETY: as above.
+                _ => unsafe { x86::read_general(self, i) },
+            },
             #[cfg(not(target_arch = "x86_64"))]
             CounterRoute::General(_) => None,
         }

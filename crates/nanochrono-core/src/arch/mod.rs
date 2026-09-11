@@ -97,7 +97,10 @@ pub fn counter_start() -> u64 {
 pub fn counter_end() -> u64 {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
-        x86::rdtscp_lfence().0
+        // Not `rdtscp_lfence` directly: `RDTSCP` is `#UD` on anything older
+        // than Nehalem or Barcelona, and this function is on the timing path
+        // of every measurement the toolkit takes. See `x86::has_rdtscp`.
+        x86::tsc_end_portable()
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -121,7 +124,9 @@ pub fn counter_ordered() -> u64 {
 pub fn counter_aux() -> Option<u32> {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
-        Some(x86::tsc_aux())
+        // `None` where the part has no `RDTSCP`, rather than a zero that
+        // would read as "core 0" and make migration look impossible.
+        x86::tsc_aux_checked()
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
     {

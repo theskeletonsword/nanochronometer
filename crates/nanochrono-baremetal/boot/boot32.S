@@ -71,19 +71,40 @@ multiboot2_header_end:
 .global _start
 .type _start, @function
 _start:
-    /* The loader leaves no usable stack, so establish one before anything
-     * that could push. */
-    mov $stack_top, %esp
-
     /* EAX holds the boot magic and EBX the info structure pointer. Both are
      * needed in 64-bit code, and neither survives the journey: `cpuid`
      * clobbers all four general registers, and the stack cannot carry them
      * either — a 32-bit `push` writes four bytes where a 64-bit `pop` reads
      * eight, so the two values would come back fused into one. Fixed storage
-     * is the only place that means the same thing on both sides of the mode
-     * switch. */
+     * in `.data` is the only place that means the same thing on both sides of
+     * the mode switch, and it survives the zeroing below.
+     *
+     * Saved first, before anything else can clobber them. */
     mov %eax, boot_magic
     mov %ebx, boot_info
+
+    /* Zero .bss, inline and before a stack exists.
+     *
+     * Multiboot 1 does not require the loader to do this, and relying on a
+     * loader that happens to means the kernel works on the machine it was
+     * tested on. Rust assumes zeroed statics, and the page tables below live
+     * here — so on a machine whose RAM still holds what POST left in it, an
+     * unzeroed .bss is an immediate triple fault rather than a subtle bug.
+     * An emulator hands over zeroed memory, which is exactly why this is the
+     * kind of difference that only shows up on real hardware.
+     *
+     * Inline rather than a `call`: the stack is itself inside .bss, so a
+     * routine would overwrite its own return address partway through and
+     * `ret` into nothing. */
+    mov $__bss_start, %edi
+    mov $__bss_end, %ecx
+    sub %edi, %ecx                  /* byte count */
+    shr $2, %ecx                    /* dwords; .bss is 4-byte aligned */
+    xor %eax, %eax
+    rep stosl
+
+    /* Now that the memory behind it is zeroed, the stack is usable. */
+    mov $stack_top, %esp
 
     call check_cpuid
     call check_long_mode
@@ -115,7 +136,19 @@ check_cpuid:
     ret
 
 /* Long mode is reported by CPUID.80000001H:EDX[29], and that leaf only exists
- * if the maximum extended leaf reaches it. */
+ * if the maximum extended leaf reaches it.
+ *
+ * PDPE1GB, bit 26 of the same register, is *recorded* rather than required.
+ * Setting the huge-page bit in a PDPT entry on a CPU without that feature
+ * makes the entry reserved rather than large, and the resulting page fault
+ * with no IDT is a triple fault — so it has to be known before the tables are
+ * built. It used to be a hard requirement, which quietly excluded every part
+ * before Westmere and Barcelona: Core 2 and Nehalem run long mode perfectly
+ * well and simply stopped here. They now take the 2 MiB path below. */
+/* Gigabytes mapped by the 2 MiB fallback, and so how many page directories
+ * it needs. See `build_2m_tables` for why sixty-four rather than 512. */
+.set PD_COUNT, 64
+
 check_long_mode:
     mov $0x80000000, %eax
     cpuid
@@ -125,6 +158,10 @@ check_long_mode:
     cpuid
     test $(1 << 29), %edx
     jz no_long_mode
+    xor %eax, %eax
+    test $(1 << 26), %edx           /* PDPE1GB */
+    setnz %al
+    mov %al, have_gib_pages
     ret
 
 /* Enables SSE, and AVX where the CPU has it.
@@ -188,42 +225,107 @@ enable_sse:
 2:
     ret
 
-/* Identity-maps the first four gigabytes with four 1 GiB pages.
+/* Identity-maps the first 512 GiB with 1 GiB pages.
  *
- * One gigabyte would cover everything this kernel allocates, but not
- * everything it must reach: a framebuffer is memory-mapped I/O, and firmware
- * commonly puts it high — QEMU's standard VGA lands around 0xFD000000. A
- * mapping that stopped at 1 GiB would fault on the first pixel, so the range
- * is sized by where devices are rather than by how much memory is used.
+ * Not because that much memory exists, but because of where firmware puts
+ * things: a UEFI framebuffer is routinely above 4 GiB, and a mapping that
+ * stopped short of it would fault on the first pixel. One PDPT holds 512
+ * entries, so covering the whole range it can address costs the same table
+ * either way.
  *
- * Four huge pages need four entries instead of two thousand; 1 GiB pages are
- * available on every CPU with long mode and PDPE1GB. */
+ * Every entry is written as a full 64-bit value. Writing only the low half —
+ * which an earlier version of this file did — leaves the upper half holding
+ * whatever was in RAM, and the upper half contains bits the architecture
+ * reserves and requires to be zero. Under an emulator that memory is already
+ * zeroed and it works; on a machine with a real POST behind it, a stray
+ * reserved bit is a page fault with no handler. */
 build_page_tables:
-    /* PML4[0] -> PDPT */
+    /* PML4[0] -> PDPT, both halves. */
     mov $pdpt, %eax
     or $0b11, %eax                  /* present + writable */
     mov %eax, pml4
+    movl $0, pml4 + 4
 
-    /* PDPT[0..3] -> 1 GiB pages at 0, 1G, 2G, 3G.
+    cmpb $0, have_gib_pages
+    je build_2m_tables
+
+    /* PDPT[i] -> a 1 GiB page at i GiB, for all 512 entries.
      *
-     * PCD (bit 4) is set on the upper three: they cover device space, and a
-     * cached framebuffer write may sit in a line instead of reaching the
-     * display. The first gigabyte is where the kernel and its stack live and
-     * stays cached. */
-    mov $0b10000011, %eax           /* present + writable + huge */
-    mov %eax, pdpt
+     * PCD (bit 4) is set on everything above the first gigabyte: that range
+     * is where MMIO lives, and a cached write to a framebuffer can sit in a
+     * cache line instead of reaching the display. The first gigabyte holds
+     * the kernel and its stack and stays cached. */
+    xor %ecx, %ecx                  /* entry index */
+1:
+    mov %ecx, %eax
+    shl $30, %eax                   /* low half of the physical address */
+    or $0b10000011, %eax            /* present + writable + huge */
+    test %ecx, %ecx
+    jz 2f
+    or $0b10000, %eax               /* PCD on everything but entry 0 */
+2:
+    mov %eax, pdpt(, %ecx, 8)
 
-    mov $0x40000000, %eax
-    or  $0b10010011, %eax           /* + PCD: uncached */
-    mov %eax, pdpt + 8
+    /* The upper half: bits 63:32 of the address. Entry i covers i GiB, so
+     * bits 61:32 of the address are i >> 2. */
+    mov %ecx, %eax
+    shr $2, %eax
+    mov %eax, pdpt + 4(, %ecx, 8)
 
-    mov $0x80000000, %eax
-    or  $0b10010011, %eax
-    mov %eax, pdpt + 16
+    inc %ecx
+    cmp $512, %ecx
+    jb 1b
+    ret
 
-    mov $0xC0000000, %eax
-    or  $0b10010011, %eax
-    mov %eax, pdpt + 24
+/* The same map, built from 2 MiB pages, for a CPU without PDPE1GB.
+ *
+ * Sixty-four gigabytes rather than the 512 the 1 GiB path covers, because the
+ * tables are the cost: a 2 MiB page directory covers one gigabyte, so 512
+ * would need two megabytes of page tables in the image. Sixty-four needs 256
+ * kilobytes and is far past anything a machine of this vintage has — 1 GiB
+ * pages arrived with Westmere and Barcelona around 2009, and PCIe devices
+ * with BARs above four gigabytes came years after that. A part that lands
+ * here has its MMIO low.
+ *
+ * PCD above the first gigabyte, exactly as the other path does, and for the
+ * same reason: that is where MMIO lives, and a cached write to a framebuffer
+ * can sit in a cache line instead of reaching the display. */
+build_2m_tables:
+    /* PDPT[i] -> pd + i * 4096, for the directories that exist. */
+    xor %ecx, %ecx
+1:
+    mov %ecx, %eax
+    shl $12, %eax                   /* i * 4096 */
+    add $pd, %eax
+    or $0b11, %eax                  /* present + writable */
+    mov %eax, pdpt(, %ecx, 8)
+    movl $0, pdpt + 4(, %ecx, 8)
+    inc %ecx
+    cmp $PD_COUNT, %ecx
+    jb 1b
+
+    /* Every 2 MiB entry across all of them, as one flat run: directory i,
+     * entry j, covers page number i * 512 + j. */
+    xor %ecx, %ecx                  /* flat page index */
+2:
+    mov %ecx, %eax
+    shl $21, %eax                   /* low half of the physical address */
+    or $0b10000011, %eax            /* present + writable + huge */
+    cmp $512, %ecx                  /* the first gigabyte stays cached */
+    jb 3f
+    or $0b10000, %eax               /* PCD */
+3:
+    mov %eax, pd(, %ecx, 8)
+
+    /* Bits 63:32 of the address. Page i covers i * 2 MiB, so the high half
+     * is i >> 11. */
+    mov %ecx, %eax
+    shr $11, %eax
+    mov %eax, pd + 4(, %ecx, 8)
+
+    inc %ecx
+    cmp $(PD_COUNT * 512), %ecx
+    jb 2b
     ret
 
 enter_long_mode:
@@ -252,13 +354,71 @@ enter_long_mode:
     ret
 
 /* Failure paths. There is no console yet — the UART is not initialised and
- * would need code that cannot run before long mode — so the only signal
- * available is the halt itself. */
+ * would need code that cannot run before long mode. But two things do work
+ * here, and an earlier version of this used neither: the VGA text buffer is
+ * plain memory at 0xB8000, and the serial port is three OUTs. So each stop
+ * says which check failed instead of halting mute.
+ *
+ * That mattered the first time this met a CPU it could not run on. The
+ * machine went black at the instant GRUB handed over, with nothing on the
+ * screen and nothing on the wire, and "it does not boot" was the entire bug
+ * report available. A single line naming the missing feature turns that into
+ * a fact. */
 no_cpuid:
+    mov $msg_no_cpuid, %esi
+    jmp die
 no_long_mode:
+    mov $msg_no_long_mode, %esi
+    jmp die
+no_gib_pages:
+    mov $msg_no_gib_pages, %esi
+    jmp die
+
+/* Prints the NUL-terminated string at %esi and stops.
+ *
+ * To both outputs, because neither is guaranteed: a machine booted with no
+ * display still has a serial port, and one with no serial port still has a
+ * screen. Writing to both costs nothing at the point where everything has
+ * already gone wrong. */
+die:
+    push %esi
+
+    /* VGA text, white on red, from the top-left corner. */
+    mov $0xB8000, %edi
+    mov $0x4F, %ah                  /* white on red */
+1:  lodsb
+    test %al, %al
+    jz 2f
+    mov %ax, (%edi)
+    add $2, %edi
+    jmp 1b
+2:
+
+    /* COM1. The port is left as firmware set it: reprogramming the divisor
+     * here would be one more thing to get wrong on a machine that has already
+     * failed a feature check. */
+    pop %esi
+3:  lodsb
+    test %al, %al
+    jz 4f
+    mov $0x3F8, %dx
+    out %al, %dx
+    jmp 3b
+4:
+    mov $'\n', %al
+    mov $0x3F8, %dx
+    out %al, %dx
+
     cli
 1:  hlt
     jmp 1b
+
+msg_no_cpuid:
+    .asciz "nanochrono: this CPU has no CPUID; it predates long mode entirely"
+msg_no_long_mode:
+    .asciz "nanochrono: this CPU does not support long mode (64-bit)"
+msg_no_gib_pages:
+    .asciz "nanochrono: this CPU has no 1 GiB pages (CPUID.80000001H:EDX[26]); the boot page tables need them"
 
 /* ---------------------------------------------------------------------------
  * 64-bit entry.
@@ -315,10 +475,21 @@ boot_info:
 
 .section .bss
 .align 4096
+/* Whether this CPU has 1 GiB pages, recorded by `check_long_mode` and read by
+ * `build_page_tables`. A byte rather than a register because the two run at
+ * different points and everything in between clobbers registers freely. */
+have_gib_pages:
+    .byte 0
+.align 4096
 pml4:
     .skip 4096
 pdpt:
     .skip 4096
+/* Page directories for the 2 MiB fallback. One per gigabyte mapped; see
+ * `build_2m_tables`. Untouched, and costing only zeroed image space, on a
+ * CPU that has 1 GiB pages. */
+pd:
+    .skip 4096 * PD_COUNT
 stack_bottom:
     /* 64 KiB. The kernel makes no deep calls and allocates nothing, but the
      * measurement buffers are stack-resident. */

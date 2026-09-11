@@ -29,3 +29,14 @@ desktop.ini
 *.symvers
 .*.cmd
 .tmp_versions/
+
+# Windows kernel driver build artifacts (kernel/windows)
+/kernel/windows/build/
+*.sys
+
+# Signing material — NEVER commit private keys or containers
+*.key
+*.pem
+*.pfx
+*.p12
+/kernel/windows/certs-private/

@@ -12,6 +12,9 @@ default = []
 # The SIMD probes. Needs a target whose ABI allows vector registers — the
 # custom `x86_64-nanochrono-none`, not the stable `x86_64-unknown-none`.
 simd = ["nanochrono-core/simd"]
+# Test-only: skip the 8042 so the USB stack is exercised on a machine
+# whose emulated PS/2 controller always answers. Not for release.
+force-usb = []
 
 [dependencies]
 # The same crate the hosted build uses, with the OS-dependent half switched

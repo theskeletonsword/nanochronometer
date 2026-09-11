@@ -20,10 +20,46 @@
 
 #[cfg(target_arch = "x86_64")]
 mod x86_acpi {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use crate::arch::x86::{inb, outb};
 
     /// `RSDPtr `, the signature that starts the Root System Description Pointer.
     const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
+
+    /// The end of the identity map, from `boot32.S`.
+    ///
+    /// Every address that comes out of a firmware table is checked against
+    /// this before it is dereferenced. A table can name anything, and this
+    /// kernel has no IDT: a read outside the map is a page fault with no
+    /// handler, which is a dead machine rather than an error.
+    const MAPPED_LIMIT: usize = 512 << 30;
+
+    /// Whether `length` bytes at `address` are inside the identity map.
+    fn mapped(address: usize, length: usize) -> bool {
+        address != 0 && address < MAPPED_LIMIT && length <= MAPPED_LIMIT - address
+    }
+
+    /// Whether an ACPI structure's bytes sum to zero, as they are defined to.
+    ///
+    /// This is the whole point of the checksum: `"RSD PTR "` is eight bytes
+    /// scanned across 128 KiB of ROM, and a byte sequence that happens to
+    /// match is not a system description. Without this check a false positive
+    /// is followed into whatever it points at.
+    ///
+    /// # Safety
+    /// `address` must name `length` readable bytes.
+    unsafe fn checksum_ok(address: usize, length: usize) -> bool {
+        if !mapped(address, length) || length == 0 {
+            return false;
+        }
+        let mut sum = 0u8;
+        for i in 0..length {
+            // SAFETY: the range was just checked to be inside the map.
+            sum = sum.wrapping_add(unsafe { read_u8(address, i) });
+        }
+        sum == 0
+    }
 
     /// Where the RSDP is allowed to live, per the ACPI specification: the first
     /// kilobyte of the Extended BIOS Data Area, or the BIOS read-only region.
@@ -52,9 +88,9 @@ mod x86_acpi {
     /// mapping and ring 0. Both hold in this kernel.
     pub unsafe fn power_registers() -> Option<PowerRegisters> {
         // SAFETY: forwarded from this function's own contract.
-        let rsdt = unsafe { find_rsdt()? };
+        let root = unsafe { find_root()? };
         // SAFETY: as above.
-        let fadt = unsafe { find_table(rsdt, b"FACP")? };
+        let fadt = unsafe { find_table(root, b"FACP")? };
 
         let mut regs = PowerRegisters::default();
 
@@ -79,13 +115,71 @@ mod x86_acpi {
 
             // DSDT pointer at offset 40, where `\_S5` lives.
             let dsdt = read_u32(fadt, 40) as usize;
-            if dsdt != 0 {
+            if mapped(dsdt, 36) {
                 let (a, b) = find_s5(dsdt);
                 regs.slp_typ_a = a;
                 regs.slp_typ_b = b;
             }
         }
         Some(regs)
+    }
+
+    /// The DSDT, as bytes, for something that can read AML properly.
+    ///
+    /// `find_s5` above scans this table for a byte pattern, which is enough
+    /// for one well-known name and not enough for anything else. Finding a
+    /// touchpad means walking the namespace and running a method, and that
+    /// wants the whole table — see `nanochrono_core::aml`.
+    ///
+    /// # Safety
+    /// Reads firmware tables; requires ring 0 and an identity map. The
+    /// returned slice borrows firmware memory, which is why it is `'static`:
+    /// nothing frees it and nothing else writes it.
+    pub unsafe fn dsdt() -> Option<&'static [u8]> {
+        // SAFETY: forwarded from this function's own contract.
+        let root = unsafe { find_root()? };
+        // SAFETY: as above.
+        let fadt = unsafe { find_table(root, b"FACP")? };
+        // SAFETY: the FADT's checksum verified, so its fields are present.
+        let length = unsafe { read_u32(fadt, 4) } as usize;
+
+        // The 32-bit pointer at offset 40, or the 64-bit one at 140 where the
+        // table sits above four gigabytes. Both are in the specification and
+        // firmware fills whichever fits, so the wide one is preferred and the
+        // narrow one is the fallback.
+        // SAFETY: as above; the wide field only exists in a long enough FADT.
+        let address = unsafe {
+            let wide = if length >= 148 {
+                let low = read_u32(fadt, 140) as u64;
+                let high = read_u32(fadt, 144) as u64;
+                (high << 32) | low
+            } else {
+                0
+            };
+            if wide != 0 {
+                wide as usize
+            } else {
+                read_u32(fadt, 40) as usize
+            }
+        };
+
+        if !mapped(address, 36) {
+            return None;
+        }
+        // SAFETY: the header is inside the identity map, checked above.
+        let table_length = unsafe { read_u32(address, 4) } as usize;
+        // A DSDT is tens of kilobytes and a large one is a megabyte. Anything
+        // outside that is a length field this should not follow.
+        if !(36..=0x40_0000).contains(&table_length) || !mapped(address, table_length) {
+            return None;
+        }
+        // SAFETY: the range is inside the identity map, checked above.
+        if !unsafe { checksum_ok(address, table_length) } {
+            return None;
+        }
+        // SAFETY: the whole declared length is inside the identity map, and
+        // firmware tables are neither freed nor written after boot.
+        Some(unsafe { core::slice::from_raw_parts(address as *const u8, table_length) })
     }
 
     /// Powers the machine off.
@@ -195,13 +289,140 @@ mod x86_acpi {
     ///
     /// # Safety
     /// Reads low physical memory; requires an identity mapping and ring 0.
-    unsafe fn find_rsdt() -> Option<usize> {
+    /// What the loader said, when it said anything.
+    ///
+    /// Set once from `kmain`, before anything reads a table. A static because
+    /// the ACPI entry points take no arguments — they are called from places
+    /// that have no reason to know how the machine was booted.
+    static LOADER_RSDP: AtomicU64 = AtomicU64::new(0);
+    /// Whether that address is an XSDT rather than an RSDT.
+    static LOADER_IS_XSDT: AtomicBool = AtomicBool::new(false);
+
+    /// Records the root table the loader found.
+    ///
+    /// On UEFI this is the *only* way to find ACPI: the RSDP's address comes
+    /// from the EFI configuration table, and nothing has put a copy where the
+    /// legacy scan looks.
+    pub fn set_root_table(rsdp: crate::multiboot::Rsdp) {
+        // The XSDT is preferred from ACPI 2.0, and firmware is allowed to
+        // leave the 32-bit address zero — which several do.
+        if rsdp.xsdt != 0 {
+            LOADER_RSDP.store(rsdp.xsdt, Ordering::Relaxed);
+            LOADER_IS_XSDT.store(true, Ordering::Relaxed);
+        } else if rsdp.rsdt != 0 {
+            LOADER_RSDP.store(rsdp.rsdt as u64, Ordering::Relaxed);
+            LOADER_IS_XSDT.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// How the root table was found, for reporting.
+    ///
+    /// Worth surfacing rather than assuming: "no ACPI" and "ACPI the loader
+    /// knew about and this did not ask for" look identical from the outside,
+    /// and the second is a bug in this kernel rather than a property of the
+    /// machine.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RootSource {
+        /// The loader copied the RSDP into the boot information. The only way
+        /// on a UEFI machine.
+        Loader,
+        /// Found by scanning the EBDA and the top of the first megabyte.
+        LegacyScan,
+        /// Neither worked.
+        None,
+    }
+
+    impl RootSource {
+        pub const fn name(self) -> &'static str {
+            match self {
+                RootSource::Loader => "loader (multiboot2 tag)",
+                RootSource::LegacyScan => "legacy scan",
+                RootSource::None => "not found",
+            }
+        }
+    }
+
+    /// Where the root table came from, and what shape it is.
+    ///
+    /// # Safety
+    /// Reads firmware memory; requires ring 0.
+    pub unsafe fn root_source() -> (RootSource, bool) {
+        if LOADER_RSDP.load(Ordering::Relaxed) != 0 {
+            return (RootSource::Loader, LOADER_IS_XSDT.load(Ordering::Relaxed));
+        }
+        // SAFETY: forwarded from this function's own contract.
+        match unsafe { scan_for_rsdp() } {
+            Some(root) => (RootSource::LegacyScan, root.is_xsdt()),
+            None => (RootSource::None, false),
+        }
+    }
+
+    /// Whether the legacy scan finds anything, regardless of what was used.
+    ///
+    /// Reported alongside the source because the difference is the whole
+    /// point: on a BIOS machine both work, and on a UEFI machine only the
+    /// loader does. Seeing "loader: yes, scan: no" on one boot and "yes, yes"
+    /// on another is what distinguishes the two firmware paths from the
+    /// outside, and it is the evidence that the loader path is load-bearing
+    /// rather than redundant.
+    ///
+    /// # Safety
+    /// Reads low memory; requires ring 0.
+    pub unsafe fn legacy_scan_works() -> bool {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { scan_for_rsdp() }.is_some()
+    }
+
+    /// A root table and how wide its entries are.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Root {
+        pub address: usize,
+        /// Eight for an XSDT, four for an RSDT. Reading a 64-bit table with
+        /// 32-bit strides finds tables at addresses made of two halves of two
+        /// different pointers.
+        pub entry_bytes: usize,
+    }
+
+    impl Root {
+        pub const fn is_xsdt(&self) -> bool {
+            self.entry_bytes == 8
+        }
+    }
+
+    /// Finds the root table: what the loader passed, or a legacy scan.
+    ///
+    /// # Safety
+    /// Reads firmware memory; requires ring 0 and an identity map.
+    pub unsafe fn find_root() -> Option<Root> {
+        let from_loader = LOADER_RSDP.load(Ordering::Relaxed);
+        if from_loader != 0 && mapped(from_loader as usize, 36) {
+            return Some(Root {
+                address: from_loader as usize,
+                entry_bytes: if LOADER_IS_XSDT.load(Ordering::Relaxed) {
+                    8
+                } else {
+                    4
+                },
+            });
+        }
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { scan_for_rsdp() }
+    }
+
+    /// The legacy scan, for a machine booted through a BIOS.
+    ///
+    /// # Safety
+    /// Reads low memory; requires ring 0 and an identity map.
+    unsafe fn scan_for_rsdp() -> Option<Root> {
         // The EBDA base is a segment address in the BIOS data area.
         // SAFETY: forwarded from this function's own contract.
         let ebda = (unsafe { core::ptr::read_volatile(EBDA_POINTER as *const u16) } as usize) << 4;
 
         for (start, end) in [(ebda, ebda + 1024), BIOS_AREA] {
-            if start == 0 {
+            // The EBDA pointer is a byte out of low memory, and on a UEFI
+            // machine there is no BIOS data area to have written it. A
+            // nonsensical one is skipped rather than scanned.
+            if start == 0 || !mapped(start, end.saturating_sub(start)) {
                 continue;
             }
             // The RSDP is 16-byte aligned by specification.
@@ -210,12 +431,38 @@ mod x86_acpi {
                 // SAFETY: as above; the range is within the first megabyte.
                 let signature = unsafe { core::ptr::read_volatile(address as *const [u8; 8]) };
                 if &signature == RSDP_SIGNATURE {
-                    // Byte 15 is the revision; from 2 the RSDP also carries an
-                    // XSDT, but the RSDT it still provides is enough here.
-                    // SAFETY: the signature matched, so the structure is present.
-                    let rsdt = unsafe { read_u32(address, 16) } as usize;
-                    if rsdt != 0 {
-                        return Some(rsdt);
+                    // Eight bytes is short enough to appear by accident. The
+                    // checksum is what the specification provides to tell a
+                    // real RSDP from a coincidence, and following an address
+                    // out of a false positive is a walk through arbitrary
+                    // memory.
+                    // SAFETY: the signature matched, so twenty bytes are present.
+                    if unsafe { checksum_ok(address, 20) } {
+                        // SAFETY: as above.
+                        let revision = unsafe { read_u8(address, 15) };
+                        // From revision 2 the XSDT is authoritative and the
+                        // 32-bit address may be zero.
+                        // SAFETY: as above; the extended fields exist from
+                        // revision 2, and their own checksum covers them.
+                        if revision >= 2 && unsafe { checksum_ok(address, 36) } {
+                            let low = unsafe { read_u32(address, 24) } as u64;
+                            let high = unsafe { read_u32(address, 28) } as u64;
+                            let xsdt = (high << 32) | low;
+                            if xsdt != 0 && mapped(xsdt as usize, 36) {
+                                return Some(Root {
+                                    address: xsdt as usize,
+                                    entry_bytes: 8,
+                                });
+                            }
+                        }
+                        // SAFETY: as above.
+                        let rsdt = unsafe { read_u32(address, 16) } as usize;
+                        if rsdt != 0 && mapped(rsdt, 36) {
+                            return Some(Root {
+                                address: rsdt,
+                                entry_bytes: 4,
+                            });
+                        }
                     }
                 }
                 address += 16;
@@ -224,24 +471,202 @@ mod x86_acpi {
         None
     }
 
+    /// Visits every SSDT the root table lists, in order.
+    ///
+    /// # Why this exists
+    ///
+    /// The ACPI namespace is not the DSDT. It is the DSDT *plus* every SSDT,
+    /// loaded in the order the root table lists them, all sharing one name
+    /// space — and firmware uses that. On the machine this was developed
+    /// against the touchpad's `Device (TPD0)` is in the DSDT while the
+    /// controller it hangs off, `Device (I2C5)` with the `_ADR` that says
+    /// where it is on the PCI bus, is in one of sixteen SSDTs. Reading only
+    /// the DSDT finds the touchpad, resolves its `_CRS` to a controller by
+    /// name, and then cannot find that controller anywhere — which is
+    /// precisely the failure this was written to fix.
+    ///
+    /// A table is offered only once its own checksum verifies, so a caller
+    /// gets bytes it can walk rather than bytes it has to validate.
+    ///
+    /// Stops early if `visit` returns false.
+    ///
+    /// # Safety
+    /// Reads firmware tables; requires ring 0 and an identity map. The slices
+    /// borrow firmware memory, which nothing frees and nothing else writes.
+    pub unsafe fn for_each_ssdt(mut visit: impl FnMut(&'static [u8]) -> bool) {
+        // SAFETY: forwarded from this function's own contract.
+        let Some(root) = (unsafe { find_root() }) else {
+            return;
+        };
+        let rsdt = root.address;
+        // SAFETY: as above.
+        let length = unsafe { read_u32(rsdt, 4) } as usize;
+        if !(36..=0x10_000).contains(&length) || !mapped(rsdt, length) {
+            return;
+        }
+        // SAFETY: the length is bounded and inside the map.
+        if !unsafe { checksum_ok(rsdt, length) } {
+            return;
+        }
+
+        let entries = (length - 36) / root.entry_bytes;
+        for i in 0..entries {
+            let at = 36 + i * root.entry_bytes;
+            // SAFETY: `i` is bounded by the verified length; the stride
+            // matches the root table's kind.
+            let table = unsafe {
+                if root.is_xsdt() {
+                    let low = read_u32(rsdt, at) as u64;
+                    let high = read_u32(rsdt, at + 4) as u64;
+                    ((high << 32) | low) as usize
+                } else {
+                    read_u32(rsdt, at) as usize
+                }
+            };
+            if !mapped(table, 36) {
+                continue;
+            }
+            // SAFETY: the address was just checked to be inside the map.
+            let signature = unsafe { core::ptr::read_volatile(table as *const [u8; 4]) };
+            if &signature != b"SSDT" {
+                continue;
+            }
+            // SAFETY: as above; the header declares its own length.
+            let table_length = unsafe { read_u32(table, 4) } as usize;
+            if !(36..=0x40_0000).contains(&table_length) || !mapped(table, table_length) {
+                continue;
+            }
+            // SAFETY: bounded and inside the map.
+            if !unsafe { checksum_ok(table, table_length) } {
+                continue;
+            }
+            // SAFETY: the whole table is inside the identity map and its
+            // checksum verified. Firmware memory outlives the kernel.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(table as *const u8, table_length) };
+            if !visit(bytes) {
+                return;
+            }
+        }
+    }
+
+    /// Visits the signature of every table the root table lists.
+    ///
+    /// A plain inventory, and the first thing worth knowing when a device is
+    /// not where it was expected: it says whether the SSDTs are there at all,
+    /// and whether the root table walks, before any question about what is
+    /// inside them.
+    ///
+    /// # Safety
+    /// Reads firmware tables; requires ring 0 and an identity map.
+    pub unsafe fn for_each_table_signature(mut visit: impl FnMut([u8; 4]) -> bool) {
+        // SAFETY: forwarded from this function's own contract.
+        let Some(root) = (unsafe { find_root() }) else {
+            return;
+        };
+        let rsdt = root.address;
+        // SAFETY: as above.
+        let length = unsafe { read_u32(rsdt, 4) } as usize;
+        if !(36..=0x10_000).contains(&length) || !mapped(rsdt, length) {
+            return;
+        }
+        // SAFETY: the length is bounded and inside the map.
+        if !unsafe { checksum_ok(rsdt, length) } {
+            return;
+        }
+
+        let entries = (length - 36) / root.entry_bytes;
+        for i in 0..entries {
+            let at = 36 + i * root.entry_bytes;
+            // SAFETY: `i` is bounded by the verified length.
+            let table = unsafe {
+                if root.is_xsdt() {
+                    let low = read_u32(rsdt, at) as u64;
+                    let high = read_u32(rsdt, at + 4) as u64;
+                    ((high << 32) | low) as usize
+                } else {
+                    read_u32(rsdt, at) as usize
+                }
+            };
+            if !mapped(table, 36) {
+                continue;
+            }
+            // SAFETY: the address was just checked to be inside the map.
+            let signature = unsafe { core::ptr::read_volatile(table as *const [u8; 4]) };
+            if !visit(signature) {
+                return;
+            }
+        }
+    }
+
+    /// How many SSDTs the root table lists and this can read.
+    ///
+    /// # Safety
+    /// As [`for_each_ssdt`].
+    pub unsafe fn ssdt_count() -> usize {
+        let mut count = 0usize;
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            for_each_ssdt(|_| {
+                count += 1;
+                true
+            })
+        };
+        count
+    }
+
     /// Finds a table by signature in the RSDT.
     ///
     /// # Safety
     /// `rsdt` must point at a valid RSDT in readable memory.
-    unsafe fn find_table(rsdt: usize, signature: &[u8; 4]) -> Option<usize> {
+    unsafe fn find_table(root: Root, signature: &[u8; 4]) -> Option<usize> {
+        let rsdt = root.address;
         // SAFETY: forwarded from this function's own contract.
         let length = unsafe { read_u32(rsdt, 4) } as usize;
-        if length < 36 {
+
+        // A declared length is a number out of firmware, not a fact. An
+        // absurd one means the pointer was not an RSDT: without this bound a
+        // garbage length of 0xFFFFFFFF becomes a billion dereferences of
+        // arbitrary addresses, and the first unmapped one ends the machine.
+        if !(36..=0x10_000).contains(&length) || !mapped(rsdt, length) {
             return None;
         }
-        let entries = (length - 36) / 4;
+        // SAFETY: the length is bounded and inside the map.
+        if !unsafe { checksum_ok(rsdt, length) } {
+            return None;
+        }
 
+        let entries = (length - 36) / root.entry_bytes;
         for i in 0..entries {
-            // SAFETY: `i` is bounded by the length the header declares.
-            let table = unsafe { read_u32(rsdt, 36 + i * 4) } as usize;
-            // SAFETY: the RSDT's entries point at tables with a standard header.
+            let at = 36 + i * root.entry_bytes;
+            // SAFETY: `i` is bounded by the verified length. An XSDT's
+            // entries are eight bytes and an RSDT's four; reading one with
+            // the other's stride finds tables at addresses made of halves of
+            // two different pointers.
+            let table = unsafe {
+                if root.is_xsdt() {
+                    let low = read_u32(rsdt, at) as u64;
+                    let high = read_u32(rsdt, at + 4) as u64;
+                    ((high << 32) | low) as usize
+                } else {
+                    read_u32(rsdt, at) as usize
+                }
+            };
+            if !mapped(table, 36) {
+                continue;
+            }
+            // SAFETY: the address was just checked to be inside the map.
             let found = unsafe { core::ptr::read_volatile(table as *const [u8; 4]) };
-            if &found == signature {
+            if &found != signature {
+                continue;
+            }
+            // SAFETY: as above; the header declares its own length.
+            let table_length = unsafe { read_u32(table, 4) } as usize;
+            if !(36..=0x10_0000).contains(&table_length) {
+                continue;
+            }
+            // SAFETY: bounded and inside the map.
+            if unsafe { checksum_ok(table, table_length) } {
                 return Some(table);
             }
         }
@@ -260,7 +685,7 @@ mod x86_acpi {
     unsafe fn find_s5(dsdt: usize) -> (Option<u16>, Option<u16>) {
         // SAFETY: forwarded from this function's own contract.
         let length = unsafe { read_u32(dsdt, 4) } as usize;
-        if !(36..=0x10_0000).contains(&length) {
+        if !(36..=0x10_0000).contains(&length) || !mapped(dsdt, length) {
             return (None, None);
         }
 
@@ -399,7 +824,10 @@ mod psci {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_acpi::{power_registers, reboot, shutdown, PowerRegisters};
+pub use x86_acpi::{
+    dsdt, for_each_ssdt, for_each_table_signature, legacy_scan_works, power_registers, reboot, root_source, set_root_table,
+    shutdown, ssdt_count, PowerRegisters, RootSource,
+};
 
 #[cfg(target_arch = "aarch64")]
 pub use psci::{power_registers, reboot, shutdown, PowerRegisters};

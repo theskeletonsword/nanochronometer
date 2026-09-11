@@ -89,6 +89,16 @@ exit_cycles=58
 baseline_cycles=12
 ```
 
+## Windows port
+
+The same detection logic — probes, gate, report format — is ported to a
+Windows kernel driver (WDM, Rust) in [`../windows/`](../windows), built for
+x86_64 and ARM64 with the `*-pc-windows-gnullvm` rustc targets. The Windows
+build cannot rely on `__ex_table` fixups (SEH fault recovery is unavailable
+under the MinGW ABI), so its hypercall probes are detection-gated instead; the
+porting guide ([`../windows/docs/PORTING_LINUX_TO_WDM.md`](../windows/docs/PORTING_LINUX_TO_WDM.md))
+maps every primitive and records the verified ABI offsets.
+
 ## Licensing
 
 This directory is **dual MIT / GPL-2.0**, not Apache-2.0 like the rest of the
@@ -102,8 +112,8 @@ incompatible with GPLv2, which the kernel is.
 
 `Dual MIT/GPL` is the most permissive recognised option: it loads without
 tainting, and an Apache-2.0 project can redistribute it without friction. See
-[`LICENSE.MIT`](LICENSE.MIT) for the MIT text; the GPL-2.0 text is the kernel's
-own `COPYING`.
+[`LICENSE-MIT`](LICENSE-MIT) for the MIT text and [`LICENSE-GPL`](LICENSE-GPL)
+for the GPL-2.0 text.
 
 The boundary is clean: this directory shares no code with the rest of the tree
 and communicates only through the text format above.
@@ -121,3 +131,45 @@ and communicates only through the text format above.
 - `hvc` on AArch64 is only meaningful from EL1. On a host kernel running at EL2
   (VHE) the instruction has different semantics; the module reports
   `current_el` so the reading can be interpreted.
+
+## The crypto benchmark (ring 0)
+
+The module also times the kernel's hash algorithms and publishes what it
+measured. This is the optional half of a two-part measurement:
+
+| Half | How it reaches the algorithm | Needs |
+|---|---|---|
+| Ring 3 | `AF_ALG` socket: `sendmsg` + `read` per operation | nothing — always built |
+| Ring 0 | a direct call, no socket, no syscall, no copy | this module |
+
+The ring-3 half is the honest cost of *using* kernel crypto from a program,
+and it is what the benchmark reports by default. It cannot separate the
+primitive from the transport. This half can: the same algorithm over the same
+16 KiB buffer, with none of the boundary crossing. **The difference between
+the two numbers is what `AF_ALG` costs.**
+
+Hashes only. A `shash` is one exported call over a flat buffer; a symmetric
+cipher needs a request object, scatterlists and a completion, and a benchmark
+that got any of those wrong would report a number for something other than
+what it named.
+
+Published as repeated `crypto=` keys, because a kernel algorithm name can
+contain characters — `cbc(aes)` — with no business on the left of an `=`:
+
+```console
+$ grep crypto /proc/nanochrono
+crypto_payload_bytes=16384
+crypto_rounds=64
+crypto=sha256,10431
+crypto=sha512,24887
+```
+
+The value is **cycles**, best of `crypto_rounds`, not nanoseconds: the module
+reads the same counter the userspace side does, and it has no calibration of
+its own to convert with. Best rather than mean for the reason every other
+measurement in this project takes a minimum — the fastest observed run is the
+one least disturbed by everything else the machine was doing.
+
+`nanochrono bench --mode kernel` picks this up automatically when the module
+is loaded and says `ring 0 module: not loaded` when it is not. Nothing
+requires it.

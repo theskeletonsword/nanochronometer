@@ -38,7 +38,7 @@
 //! mode 0700, which would have limited the report to root, and the whole point
 //! is for an unprivileged measurement process to read it.
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::fmt::{self, Write as _};
 
 use kernel::prelude::*;
@@ -60,8 +60,15 @@ module! {
     license: "Dual MIT/GPL",
 }
 
-/// Bumped when the output format changes incompatibly.
-const FORMAT_VERSION: u32 = 1;
+/// Bumped when the report gains or changes fields.
+///
+/// Version 2 added the CPU's own vendor and lineage, the Centaur extended
+/// leaf maximum, and the in-kernel crypto timings. A reader that finds
+/// version 1 is talking to a module built before those existed — which is
+/// what an already-loaded module from an earlier build looks like, and why
+/// this number is worth checking rather than assuming a rebuild reached the
+/// running kernel.
+const FORMAT_VERSION: u32 = 2;
 
 /// Rounds for the minimum-of-N trap measurement. Enough to find the floor,
 /// short enough that preemption stays disabled for a negligible time.
@@ -236,7 +243,179 @@ impl fmt::Write for ReportBuffer {
 
 fn write_report(f: &mut ReportBuffer) -> fmt::Result {
     writeln!(f, "version={FORMAT_VERSION}")?;
-    write_arch_report(f)
+    write_arch_report(f)?;
+    write_crypto_report(f)
+}
+
+// ---------------------------------------------------------------------------
+// Ring 0 crypto, the optional half of the crypto benchmark
+// ---------------------------------------------------------------------------
+
+// The userspace side of this measurement reaches the kernel's crypto API
+// through `AF_ALG`: a socket, a `sendmsg` and a `read` per operation. That
+// number is the honest cost of *using* kernel crypto from a program, and it
+// is the one that always gets measured, because it needs no module.
+//
+// It cannot separate the primitive from the transport. This can: the same
+// algorithms called here run with no socket, no syscall and no copy across
+// the privilege boundary, so the difference between the two numbers is what
+// `AF_ALG` costs. That is the whole reason this half exists, and it is why
+// it is optional — it answers a sharper question, at the price of building
+// and loading a module.
+//
+// Hashes only. A `shash` is a single exported call over a flat buffer;
+// a symmetric cipher needs a request object, scatterlists and a completion,
+// and a benchmark that got any of those wrong would report a number for
+// something other than what it named. What is here is certainly right.
+
+/// `struct crypto_shash` is opaque to this module: it is only ever held as a
+/// pointer and handed back to the kernel.
+#[repr(C)]
+struct CryptoShash {
+    _opaque: [u8; 0],
+}
+
+unsafe extern "C" {
+    /// `crypto_alloc_shash(const char *alg_name, u32 type, u32 mask)`.
+    ///
+    /// Returns an `ERR_PTR` rather than null on failure, which is why the
+    /// caller checks the pointer's magnitude rather than testing for null.
+    fn crypto_alloc_shash(alg_name: *const c_char, ty: u32, mask: u32) -> *mut CryptoShash;
+    /// `crypto_shash_tfm_digest(tfm, data, len, out)` — hash a flat buffer in
+    /// one call, with the descriptor allocated by the kernel. Exported since
+    /// 5.8 precisely so a caller need not build a `SHASH_DESC_ON_STACK`.
+    fn crypto_shash_tfm_digest(
+        tfm: *mut CryptoShash,
+        data: *const u8,
+        len: c_uint,
+        out: *mut u8,
+    ) -> c_int;
+    /// `crypto_destroy_tfm(void *mem, struct crypto_tfm *tfm)`. The shash
+    /// free is a macro over this in C; from here it is the exported symbol.
+    fn crypto_destroy_tfm(mem: *mut c_void, tfm: *mut CryptoShash);
+}
+
+/// The last address that can be an `ERR_PTR`.
+///
+/// The kernel returns errors as pointers in the top page. Anything at or
+/// above this is a negative errno wearing a pointer's clothes, and
+/// dereferencing it is how a module oopses.
+const ERR_PTR_FLOOR: usize = usize::MAX - 4095;
+
+/// Algorithms measured here, by the kernel's own names.
+///
+/// The same five the userspace side asks for through `AF_ALG`, so every row
+/// of the ring-0 mode has a ring-3 row measuring the same algorithm over the
+/// same buffer, and the two can simply be subtracted. An algorithm this
+/// kernel was not built with is skipped rather than reported as zero.
+const CRYPTO_ALGORITHMS: &[&str] = &["sha1", "sha256", "sha512", "sha3-256", "crc32c"];
+
+/// Bytes hashed per operation.
+///
+/// The same size the userspace benchmark uses, so the two numbers are
+/// comparable. A different buffer would make the comparison meaningless
+/// while still looking like one.
+const CRYPTO_PAYLOAD: usize = 16 * 1024;
+
+/// Operations per algorithm. Small: this runs inside a `/proc` read, with
+/// preemption enabled and no business holding a CPU for long.
+const CRYPTO_ROUNDS: usize = 64;
+
+/// The largest digest any algorithm here produces.
+const MAX_DIGEST: usize = 64;
+
+/// Times each algorithm and writes one line per success.
+///
+/// Emitted as repeated `crypto=` keys rather than one key per algorithm,
+/// because an algorithm's kernel name can contain characters — `cbc(aes)` —
+/// that have no place on the left of an `=`.
+///
+/// A failure is silent by design: an algorithm this kernel was not built with
+/// is an ordinary kernel, and a missing line says that more clearly than an
+/// error line would.
+fn write_crypto_report(f: &mut ReportBuffer) -> fmt::Result {
+    writeln!(f, "crypto_payload_bytes={CRYPTO_PAYLOAD}")?;
+    writeln!(f, "crypto_rounds={CRYPTO_ROUNDS}")?;
+
+    for name in CRYPTO_ALGORITHMS {
+        if let Some(cycles) = time_shash(name) {
+            writeln!(f, "crypto={name},{cycles}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Best-of-N cycles for one full digest of [`CRYPTO_PAYLOAD`] bytes.
+///
+/// Best rather than mean, for the same reason every other measurement in this
+/// project takes a minimum: the fastest observed run is the one least
+/// disturbed by everything else the machine was doing, and in a kernel with
+/// preemption on that is the only figure with a defensible meaning.
+///
+/// `None` when the algorithm is not available, which is not an error.
+fn time_shash(name: &str) -> Option<u64> {
+    // The C API takes a NUL-terminated name and these are compile-time
+    // constants, so the terminator is added here rather than requiring every
+    // entry in the table to carry one.
+    let mut zname = [0u8; 32];
+    let bytes = name.as_bytes();
+    if bytes.len() >= zname.len() {
+        return None;
+    }
+    zname[..bytes.len()].copy_from_slice(bytes);
+
+    // SAFETY: `zname` is NUL-terminated and outlives the call; type and mask
+    // of zero ask for any implementation, which is what the kernel's own
+    // callers pass.
+    let tfm = unsafe { crypto_alloc_shash(zname.as_ptr().cast(), 0, 0) };
+    if tfm.is_null() || (tfm as usize) >= ERR_PTR_FLOOR {
+        return None;
+    }
+
+    let mut best = u64::MAX;
+    let mut digest = [0u8; MAX_DIGEST];
+    // A static rather than a stack buffer: sixteen kilobytes is far past what
+    // a kernel stack will hold, and this runs single-threaded under the
+    // procfs read lock.
+    let payload = payload_buffer();
+
+    for _ in 0..CRYPTO_ROUNDS {
+        let start = counter_start();
+        // SAFETY: `tfm` was allocated above and not freed; the payload and
+        // digest pointers are valid for the lengths given, and the digest
+        // buffer is the largest any listed algorithm produces.
+        let rc = unsafe {
+            crypto_shash_tfm_digest(
+                tfm,
+                payload.as_ptr(),
+                CRYPTO_PAYLOAD as c_uint,
+                digest.as_mut_ptr(),
+            )
+        };
+        let end = counter_end();
+        if rc != 0 {
+            best = u64::MAX;
+            break;
+        }
+        let elapsed = end.wrapping_sub(start);
+        if elapsed != 0 && elapsed < best {
+            best = elapsed;
+        }
+    }
+
+    // SAFETY: `tfm` came from `crypto_alloc_shash` and is freed exactly once.
+    unsafe { crypto_destroy_tfm(core::ptr::null_mut(), tfm) };
+
+    (best != u64::MAX).then_some(best)
+}
+
+/// The buffer every digest runs over.
+///
+/// Zero-filled and never written: its contents do not change what a hash
+/// costs, and a constant makes runs comparable across boots.
+fn payload_buffer() -> &'static [u8; CRYPTO_PAYLOAD] {
+    static PAYLOAD: [u8; CRYPTO_PAYLOAD] = [0u8; CRYPTO_PAYLOAD];
+    &PAYLOAD
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +438,37 @@ fn write_arch_report(f: &mut ReportBuffer) -> fmt::Result {
     writeln!(f, "vmx_available={}", u32::from(leaf1[2] & (1 << 5) != 0))?;
     let ext1 = cpuid(0x8000_0001, 0);
     writeln!(f, "svm_available={}", u32::from(ext1[2] & (1 << 2) != 0))?;
+
+    // Who made the part. Read before anything else because it decides how the
+    // rest is interpreted — and because a Zhaoxin is close enough to an Intel
+    // that code assuming "not AMD means Intel" runs on one and misreads it.
+    //
+    // The register order is EBX, EDX, ECX. That is not a transcription slip:
+    // it is the order `CPUID.0H` defines, and reading them as EBX, ECX, EDX
+    // spells `GenuntelineI`.
+    let identity = cpuid(0, 0);
+    let mut cpu_vendor = [0u8; 12];
+    cpu_vendor[0..4].copy_from_slice(&identity[1].to_le_bytes());
+    cpu_vendor[4..8].copy_from_slice(&identity[3].to_le_bytes());
+    cpu_vendor[8..12].copy_from_slice(&identity[2].to_le_bytes());
+    write!(f, "cpu_vendor=")?;
+    for &byte in cpu_vendor.iter() {
+        if (0x20..0x7f).contains(&byte) {
+            write!(f, "{}", byte as char)?;
+        }
+    }
+    writeln!(f)?;
+    writeln!(f, "cpu_family={}", cpu_family_name(&cpu_vendor))?;
+
+    // The Centaur extended range. Only the VIA/Centaur lineage and its
+    // Zhaoxin successor implement it — it is to them what `0x8000_0000` is to
+    // AMD — so a maximum inside the range it describes is positive
+    // identification even where the vendor string has been overridden, which
+    // firmware and hypervisors both do.
+    let centaur_max = cpuid(0xC000_0000, 0)[0];
+    if (0xC000_0000..=0xC000_FFFF).contains(&centaur_max) {
+        writeln!(f, "centaur_max_leaf={centaur_max:#x}")?;
+    }
 
     let vendor = cpuid(0x4000_0000, 0);
     let mut signature = [0u8; 12];
@@ -289,6 +499,28 @@ fn write_arch_report(f: &mut ReportBuffer) -> fmt::Result {
     writeln!(f, "exit_cycles={trap}")?;
     writeln!(f, "baseline_cycles={baseline}")?;
     Ok(())
+}
+
+/// Names the lineage a vendor signature belongs to.
+///
+/// Zhaoxin is the reason this exists. Its parts are x86-64 descended from
+/// VIA's Centaur line: they carry Intel-style architectural performance
+/// counters, Intel-style machine-check banks, and VMX — so KVM drives them
+/// through the same `VMCALL` path an Intel part uses, and the hypercall probe
+/// below needs no special case. What they do *not* share is Intel's
+/// trustworthy `CPUID.15H`/`16H` counter-rate leaves, which Linux reads on
+/// Intel alone. Naming the part is what lets a reader of this report know
+/// which of those two facts applies.
+fn cpu_family_name(signature: &[u8; 12]) -> &'static str {
+    match signature {
+        b"GenuineIntel" => "intel",
+        b"AuthenticAMD" => "amd",
+        // Spaces included: the string is exactly twelve bytes and Zhaoxin
+        // pads it on both sides.
+        b"  Shanghai  " => "zhaoxin",
+        b"CentaurHauls" => "centaur",
+        _ => "unknown",
+    }
 }
 
 /// `CPUID` with an explicit subleaf.

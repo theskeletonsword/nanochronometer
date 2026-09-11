@@ -75,10 +75,24 @@ impl ClockRoute {
     pub fn is_available(self) -> bool {
         match self {
             ClockRoute::Auto | ClockRoute::WallRealtimeNs | ClockRoute::MonotonicNs => true,
-            ClockRoute::X86RdtscRaw
-            | ClockRoute::X86RdtscLfence
-            | ClockRoute::X86RdtscMfence
-            | ClockRoute::X86RdtscpLfence => cfg!(any(target_arch = "x86_64", target_arch = "x86")),
+            ClockRoute::X86RdtscRaw | ClockRoute::X86RdtscLfence | ClockRoute::X86RdtscMfence => {
+                cfg!(any(target_arch = "x86_64", target_arch = "x86"))
+            }
+            // `RDTSCP` is an architecture *and* a feature: it is `#UD` on
+            // anything older than Nehalem or Barcelona. Reporting the route
+            // as available there and then executing it is `SIGILL` in a
+            // process and a triple fault in this project's freestanding
+            // kernel, so the CPU is asked rather than the target.
+            ClockRoute::X86RdtscpLfence => {
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                {
+                    arch::x86::has_rdtscp()
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+                {
+                    false
+                }
+            }
             ClockRoute::Arm64Cntfrq | ClockRoute::Arm64Cntvct | ClockRoute::Arm64CntvctIsb => {
                 cfg!(target_arch = "aarch64")
             }
@@ -201,7 +215,10 @@ fn read_counter(route: ClockRoute) -> u64 {
             ClockRoute::X86RdtscRaw => x::rdtsc_raw(),
             ClockRoute::X86RdtscLfence => x::rdtsc_lfence(),
             ClockRoute::X86RdtscMfence => x::rdtsc_mfence(),
-            ClockRoute::X86RdtscpLfence => x::rdtscp_lfence().0,
+            // Portable by construction: `is_available` refuses this route on
+            // a part without `RDTSCP`, and a caller that names it anyway gets
+            // the fenced `RDTSC` rather than an invalid opcode.
+            ClockRoute::X86RdtscpLfence => x::tsc_end_portable(),
             _ => arch::counter_start(),
         }
     }
@@ -377,9 +394,14 @@ impl NanoclockSnapshot {
             snap.rdtsc_raw = x::rdtsc_raw();
             snap.rdtsc_lfence = x::rdtsc_lfence();
             snap.rdtsc_mfence = x::rdtsc_mfence();
-            let (t, aux) = x::rdtscp_lfence();
-            snap.rdtscp_lfence = t;
-            snap.rdtscp_aux = aux;
+            // Left at zero on a part with no `RDTSCP`. A snapshot is a
+            // record of what this machine can do, and "cannot" is one of the
+            // things it can record — executing the instruction to find out
+            // would end the process.
+            if let Some(aux) = x::tsc_aux_checked() {
+                snap.rdtscp_lfence = x::tsc_end_portable();
+                snap.rdtscp_aux = aux;
+            }
         }
 
         #[cfg(target_arch = "aarch64")]

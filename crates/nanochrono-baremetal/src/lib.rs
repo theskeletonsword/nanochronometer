@@ -47,13 +47,37 @@
 pub mod abi;
 pub mod acpi;
 pub mod arch;
+/// x86 only: the PIT and the CMOS real-time clock are PC firmware. An AArch64
+/// board has `CNTFRQ_EL0`, which needs no calibration at all.
+#[cfg(target_arch = "x86_64")]
+pub mod clock;
 pub mod draw;
 pub mod font;
 pub mod framebuffer;
-/// x86 only: the 8042 controller and the multiboot framebuffer are PC
-/// firmware. An AArch64 board reports its console over the serial port.
+/// Detection and host-time negotiation. Both architectures, because at ring 0
+/// the hypercall is available on both — unlike the hosted build, where it is
+/// not available at all.
+pub mod hypervisor;
+pub mod typeface;
+
+/// The interface. The x86 and AArch64 sides are separate modules — different
+/// firmware hands the screen and console over in different ways — and `gui`
+/// re-exports whichever one compiles for the machine at hand.
 #[cfg(target_arch = "x86_64")]
+mod gui_x86_64;
+#[cfg(target_arch = "aarch64")]
+mod gui_arm64;
 pub mod gui;
+/// x86 only: the controller is an Intel LPSS device on the PCI bus.
+#[cfg(target_arch = "x86_64")]
+pub mod i2c;
+/// x86 only: an Intel GPIO controller, found through the DSDT. Read to know
+/// when an I2C-HID device has a report waiting, instead of asking the bus.
+#[cfg(target_arch = "x86_64")]
+pub mod gpio;
+/// x86 only: it needs the DSDT, PCI and the I2C controller.
+#[cfg(target_arch = "x86_64")]
+pub mod i2c_hid;
 /// x86 only: the 8042 controller and the multiboot framebuffer are PC
 /// firmware. An AArch64 board reports its console over the serial port.
 #[cfg(target_arch = "x86_64")]
@@ -64,9 +88,22 @@ pub mod panic;
 /// firmware. An AArch64 board reports its console over the serial port.
 #[cfg(target_arch = "x86_64")]
 pub mod panic_screen;
+/// x86 only: PCI configuration space is reached through I/O ports.
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
 pub mod pmu;
+/// x86 only: it needs the multiboot framebuffer.
+#[cfg(target_arch = "x86_64")]
+pub mod progress;
 pub mod selftest;
 pub mod serial;
+pub mod text;
+/// x86 only: the text buffer is PC firmware.
+#[cfg(target_arch = "x86_64")]
+pub mod vga;
+/// x86 only for now: the controller is found through PCI.
+#[cfg(target_arch = "x86_64")]
+pub mod xhci;
 
 pub use nanochrono_core::{arch as core_arch, cpu, Backend, Integrity, Protected, SimdFamily};
 

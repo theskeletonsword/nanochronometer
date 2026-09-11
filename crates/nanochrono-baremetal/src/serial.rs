@@ -8,6 +8,20 @@
 //! stdio`, which is what makes this kernel testable at all.
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether output is still being attempted.
+///
+/// Starts true and is only cleared by evidence: a probe that says there is no
+/// UART is a *hint*, and a hint that turns out to be wrong would silence the
+/// log on a machine that has a perfectly good port. What actually clears this
+/// is the transmitter timing out — which cannot be wrong, because it means
+/// the byte was not sent.
+///
+/// The point of clearing it at all is cost. Each timeout is bounded, but
+/// paying one per character on a machine with no serial port turns a page of
+/// output into a visible stall.
+static LIVE: AtomicBool = AtomicBool::new(true);
 
 /// A UART, wherever this architecture keeps one.
 pub struct Serial;
@@ -29,13 +43,39 @@ impl Serial {
         unsafe {
             pl011::init()
         }
+        LIVE.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether output is still going anywhere.
+    ///
+    /// Worth surfacing: on a machine with no serial port the log goes
+    /// nowhere, and that is not the same as a kernel that produced none.
+    pub fn is_live() -> bool {
+        LIVE.load(Ordering::Relaxed)
     }
 
     fn put(byte: u8) {
+        // The VGA text console, when there is no framebuffer to draw on. It
+        // is not an alternative to the serial port but a parallel one: a
+        // machine with neither has nowhere to report a failure, and that is
+        // the case where a fault looks like a boot that never happened.
         #[cfg(target_arch = "x86_64")]
-        x86_uart::put(byte);
+        crate::vga::put(byte);
+
+        if !LIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        let sent = x86_uart::put(byte);
         #[cfg(target_arch = "aarch64")]
-        pl011::put(byte);
+        let sent = pl011::put(byte);
+
+        if !sent {
+            // The transmitter never reported ready. There is no port, or
+            // nothing is draining it; either way further attempts would only
+            // pay the timeout again.
+            LIVE.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -102,16 +142,34 @@ mod x86_uart {
         }
     }
 
-    pub(super) fn put(byte: u8) {
+    /// How long to wait for the transmitter, in spin iterations.
+    ///
+    /// Bounded, and that bound is not a nicety. A laptop has no UART at
+    /// `0x3F8`: reading an unassigned port gives `0xFF` on most chipsets,
+    /// where bit 5 happens to be set and the write is harmlessly discarded —
+    /// but some return `0x00`, and an unbounded wait for a bit that will
+    /// never set hangs the machine on the *first* character printed, before
+    /// anything else has run.
+    ///
+    /// That is indistinguishable from a kernel that never started, which is
+    /// exactly what it looks like from the outside.
+    const TX_SPIN_LIMIT: u32 = 100_000;
+
+    /// Sends one byte. `false` if the transmitter never became ready.
+    pub(super) fn put(byte: u8) -> bool {
         // Bit 5 of the line status register is "transmit holding register
         // empty". Writing before it is set drops the byte.
-        // SAFETY: reading the line status register has no side effects, and
-        // the freestanding build is always at CPL 0.
-        while unsafe { inb(COM1 + 5) } & 0x20 == 0 {
+        for _ in 0..TX_SPIN_LIMIT {
+            // SAFETY: reading the line status register has no side effects,
+            // and the freestanding build is always at CPL 0.
+            if unsafe { inb(COM1 + 5) } & 0x20 != 0 {
+                // SAFETY: as above; the port is initialised by `init`.
+                unsafe { outb(COM1, byte) };
+                return true;
+            }
             core::hint::spin_loop();
         }
-        // SAFETY: as above; the port is initialised by `init`.
-        unsafe { outb(COM1, byte) };
+        false
     }
 }
 
@@ -134,15 +192,25 @@ mod pl011 {
         // here.
     }
 
-    pub(super) fn put(byte: u8) {
+    /// Bounded for the same reason the x86 side is: a board that maps
+    /// nothing at this address leaves TXFF set forever, and waiting on it
+    /// hangs the kernel on its first character.
+    const TX_SPIN_LIMIT: u32 = 100_000;
+
+    /// Sends one byte. `false` if the FIFO never drained.
+    pub(super) fn put(byte: u8) -> bool {
         // UARTFR bit 5 is TXFF, "transmit FIFO full".
-        // SAFETY: the flag register is a device MMIO read with no side
-        // effects, at an address fixed by the machine model.
-        while unsafe { core::ptr::read_volatile(UARTFR as *const u32) } & (1 << 5) != 0 {
+        for _ in 0..TX_SPIN_LIMIT {
+            // SAFETY: the flag register is a device MMIO read with no side
+            // effects, at an address fixed by the machine model.
+            if unsafe { core::ptr::read_volatile(UARTFR as *const u32) } & (1 << 5) == 0 {
+                // SAFETY: the data register accepts a byte and is mapped by
+                // the machine model.
+                unsafe { core::ptr::write_volatile(UARTDR as *mut u32, byte as u32) };
+                return true;
+            }
             core::hint::spin_loop();
         }
-        // SAFETY: the data register accepts a byte and is mapped by the
-        // machine model.
-        unsafe { core::ptr::write_volatile(UARTDR as *mut u32, byte as u32) };
+        false
     }
 }

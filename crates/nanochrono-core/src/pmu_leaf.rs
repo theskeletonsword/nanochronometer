@@ -208,6 +208,27 @@ pub const fn mask_to_width(raw: u64, width: u8) -> u64 {
     }
 }
 
+/// Assembles an AMD core-counter event select value from an event number and
+/// a unit mask.
+///
+/// AMD's `PerfEvtSel` register splits the event number across two fields:
+/// bits 7:0 hold the low byte and bits 35:32 hold the extension — an event
+/// like `0x1C0` (retired instructions on Family 15h) is encoded as `0x100`
+/// shifted into bit 32, not as a byte that overflows. The unit mask sits in
+/// bits 15:8. This is the `AMD_PMC_TO_EVENTMASK`/`AMD_PMC_TO_UNITMASK`
+/// encoding from FreeBSD's `hwpmc_amd.h` (BSD-2-Clause; see `NOTICE`), and
+/// the split fields are spelled out in AMD's BKDG, publication 32559.
+///
+/// The caller still ORs in the control bits (`USR`, `OS`, `EN`) — this only
+/// builds the event-qualification half, so the result is safe to reuse when
+/// reprogramming a counter with a different event.
+#[inline]
+pub const fn amd_event_select(event: u16, unit_mask: u8) -> u64 {
+    (event as u64 & 0xFF)
+        | (((event as u64 & 0xF00)) << 24)
+        | ((unit_mask as u64) << 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +424,33 @@ mod tests {
             core_type: CoreType::Uniform,
         };
         assert_eq!(after.delta_since(before), Some(20));
+    }
+
+    /// An AMD event number below `0x100` lives entirely in bits 7:0.
+    #[test]
+    fn amd_events_under_256_live_in_the_low_byte() {
+        // `CPU Clocks not Halted`, 76h, no unit mask.
+        assert_eq!(amd_event_select(0x76, 0), 0x76);
+        // `Retired Instructions`, C0h.
+        assert_eq!(amd_event_select(0xC0, 0), 0xC0);
+        // A unit mask lands in bits 15:8.
+        assert_eq!(amd_event_select(0xCB, 0x0F), 0x0FCB);
+    }
+
+    /// An event number with bits above 7:0 moves them to bits 35:32, per
+    /// FreeBSD's `AMD_PMC_TO_EVENTMASK`. Family 15h's EX/LS events start at
+    /// `0x1C0`.
+    #[test]
+    fn amd_events_above_255_put_their_extension_in_bits_35_32() {
+        // 0x1C0 & 0xFF = 0xC0; 0x1C0 & 0xF00 = 0x100, shifted to bit 32.
+        assert_eq!(amd_event_select(0x1C0, 0), 0x1_0000_00C0);
+        // The highest event the register encodes, 0xFFF, sets bits 32-35.
+        assert_eq!(
+            amd_event_select(0xFFF, 0xFF),
+            0xF_0000_00FF | 0xFF00
+        );
+        // The low byte and the extension are independent.
+        assert_eq!(amd_event_select(0xC1, 0), 0xC1);
+        assert_eq!(amd_event_select(0x1D8, 0), 0x1_0000_00D8);
     }
 }

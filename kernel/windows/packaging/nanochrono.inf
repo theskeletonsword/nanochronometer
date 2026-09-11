@@ -1,0 +1,58 @@
+; SPDX-License-Identifier: MIT
+;
+; NanoChronometer — legacy (non-Plug-and-Play) kernel driver INF.
+;
+; This is a "legacy" driver managed with the Service Control Manager, so the
+; INF is used with `rndis`-less tooling that binds the .sys to a service:
+;
+;   RUNDLL32.EXE setupapi.dll,InstallHinfSection DefaultInstall 132 .\nanochrono.inf
+;
+; or manually (recommended):
+;
+;   sc create nanochrono type= kernel binPath= "<abs>\nanochrono_x64.sys"
+;   bcdedit /set testsigning on   (test-signed drivers)
+;   sc start nanochrono
+;   sc stop nanochrono && sc delete nanochrono
+;
+; On ARM64 devices use nanochrono_arm64.sys. Surface Pro X / Surface Pro 9 5G
+; and friends run ARM64 Windows; test-signing works there too.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Provider    = "NanoChronometer Project"
+DriverVer   = 09/10/2026,1.0.0.0
+CatalogFile = nanochrono.cat
+
+[DefaultInstall]
+CopyFiles  = @nanochrono.sys
+AddService = nanochrono, 0x00000002, nanochrono_Service
+
+[DefaultInstall.NTamd64]
+CopyFiles  = @nanochrono.sys
+
+[DefaultInstall.NTARM64]
+CopyFiles  = @nanochrono.sys
+
+[DefaultUninstall]
+DelService = nanochrono, 0x200
+DelFiles   = @nanochrono.sys
+
+[nanochrono_Service]
+DisplayName   = "NanoChronometer hypervisor detector"
+Description   = "Ring-0 hypervisor presence/probe report driver (test signing)"
+ServiceType   = 1    ; SERVICE_KERNEL_DRIVER
+StartType     = 3    ; SERVICE_DEMAND_START
+ErrorControl  = 1    ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\nanochrono.sys
+
+[DestinationDirs]
+DefaultDestDir = 12   ; %windir%\system32\drivers
+
+[nanochrono_AddReg_Flags]
+; (reserved for future driver key settings)
+
+[SourceDisksNames]
+1 = "NanoChronometer driver files",,,
+
+[SourceDisksFiles]
+nanochrono.sys = 1,,

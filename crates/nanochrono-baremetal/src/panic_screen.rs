@@ -14,6 +14,7 @@ use crate::acpi;
 use crate::arch::x86::inb;
 use crate::draw::{self, Palette};
 use crate::framebuffer::Framebuffer;
+use crate::typeface::{BODY, TITLE};
 
 /// The 8042 keyboard controller's data and status ports.
 const PS2_DATA: u16 = 0x60;
@@ -48,70 +49,58 @@ unsafe fn graphical(fb: &Framebuffer, reason: &str, power: Option<&acpi::PowerRe
     fb.clear(p.background);
 
     let w = fb.width;
-    let scale = if w >= 1280 { 3 } else { 2 };
 
-    // A band across the top, the way the desktop GUI carries its title bar.
-    fb.fill(0, 0, w, 8 * scale + 24, p.panel);
-    draw::text(fb, 24, 12, "NANOCHRONOMETER — STOPPED", p.title, scale);
+    // A header band, the way the desktop GUI carries its title bar.
+    draw::gradient(fb, 0, 0, w, 76, p.header_from, p.header_to);
+    fb.fill(0, 75, w, 1, p.divider);
+    draw::text(fb, &TITLE, 28, 20, "Stopped", p.title);
 
-    let mut y = 8 * scale + 60;
+    let mut y = 116;
+    draw::text(fb, &BODY, 28, y, "The kernel cannot continue.", p.text);
+    y += BODY.line_height as u32 + 10;
     draw::text(
         fb,
-        24,
+        &BODY,
+        28,
         y,
-        "The kernel stopped and cannot continue.",
-        p.text,
-        2,
-    );
-    y += 34;
-    draw::text(
-        fb,
-        24,
-        y,
-        "It is waiting instead of restarting, so the",
+        "It is waiting rather than restarting, so the reason below is not",
         p.muted,
-        2,
     );
-    y += 22;
-    draw::text(
-        fb,
-        24,
-        y,
-        "reason below is not lost to a reboot loop.",
-        p.muted,
-        2,
-    );
+    y += BODY.line_height as u32;
+    draw::text(fb, &BODY, 28, y, "lost to a reboot loop.", p.muted);
 
-    y += 48;
-    draw::text(fb, 24, y, "REASON", p.accent, 2);
-    y += 26;
+    y += 42;
+    draw::text(fb, &BODY, 28, y, "REASON", p.accent);
+    y += BODY.line_height as u32 + 8;
     // The reason can be long; wrap it rather than running off the edge.
-    let columns = ((w - 48) / (8 * 2)) as usize;
+    // Characters per line is estimated from the widest common glyph, since
+    // the face is proportional and an exact fit would need measuring twice.
+    let columns = ((w - 56) / BODY.width_of("m").max(1)) as usize;
     for chunk in draw::wrap(reason, columns.max(16)) {
-        draw::text(fb, 24, y, chunk, p.text, 2);
-        y += 20;
+        draw::text(fb, &BODY, 28, y, chunk, p.text);
+        y += BODY.line_height as u32;
     }
 
     // The two controls, in the corner the desktop GUI puts its window buttons
     // — except these restart and power off, because on bare metal there is no
     // window to minimise and nothing to close to.
-    let button_w = 260;
+    let button_w = 240;
     let button_h = 56;
     let by = fb.height.saturating_sub(button_h + 40);
     let reboot_x = w.saturating_sub(button_w * 2 + 60);
     let off_x = w.saturating_sub(button_w + 30);
 
-    draw::button(fb, reboot_x, by, button_w, button_h, "[R]  RESTART", &p);
-    draw::button(fb, off_x, by, button_w, button_h, "[S]  SHUT DOWN", &p);
+    draw::button(fb, reboot_x, by, button_w, button_h, "R    Restart", &p);
+    draw::button(fb, off_x, by, button_w, button_h, "S    Shut down", &p);
 
     if power.is_none() {
         draw::text(
             fb,
-            24,
-            by + 20,
+            &BODY,
+            28,
+            by + 18,
             "no ACPI tables found; using fallbacks",
             p.muted,
-            2,
         );
     }
 

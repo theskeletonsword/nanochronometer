@@ -42,6 +42,35 @@ pub fn cntvct_isb() -> u64 {
     v
 }
 
+/// `DSB SY` + `ISB` + `CNTVCT_EL0` + `ISB`: the fully ordered virtual read.
+///
+/// The mirror of [`cntpct_ordered`]: the same barriers around the *virtual*
+/// counter, which reads `CNTPCT_EL0` minus `CNTVOFF_EL2`. A hypervisor sets
+/// that offset so a guest sees a timeline starting when the guest did, so the
+/// virtual counter is the safe default for any kernel that may run inside
+/// one — the physical counter would expose (and splice together) the host's
+/// real timeline.
+///
+/// `DSB SY` waits for memory traffic so the counter is sampled at the end of
+/// the bracketed work, exactly as [`cntpct_ordered`] does for its counter.
+#[inline(always)]
+pub fn cntvct_ordered() -> u64 {
+    let v: u64;
+    // SAFETY: the barriers have no operands or memory effects, and CNTVCT_EL0
+    // is readable at EL0 when CNTKCTL_EL1.EL0VCTEN allows it (always at EL1).
+    unsafe {
+        asm!(
+            "dsb sy",
+            "isb",
+            "mrs {v}, cntvct_el0",
+            "isb",
+            v = out(reg) v,
+            options(nostack, preserves_flags),
+        );
+    }
+    v
+}
+
 /// Raw `CNTPCT_EL0`, the *physical* counter.
 ///
 /// `CNTVCT_EL0` is the virtual counter: it reads `CNTPCT_EL0` minus

@@ -44,6 +44,52 @@ pub struct HostSync {
     pub pairing: Option<ClockPairing>,
 }
 
+use core::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+
+/// How many times this process has asked the host for its clock.
+///
+/// # Why this is counted, and kept at one
+///
+/// `PTP_SYS_OFFSET_PRECISE` on the `ptp_kvm` device is not a file read. The
+/// driver services it by making the guest issue `KVM_HC_CLOCK_PAIRING` — a
+/// `VMCALL` on x86, an `HVC` on AArch64 — which traps out of this virtual
+/// machine and into the host kernel, where it is serviced on a CPU that other
+/// tenants are also using.
+///
+/// On a laptop that costs microseconds and nobody notices. On a shared VPS —
+/// an Azure or GCE instance sitting on a host with a dozen neighbours — a
+/// program that did it per measurement would be taking a scheduling event out
+/// of somebody else's machine, thousands of times a second, to answer a
+/// question whose answer does not change. That is not a performance problem
+/// for this program; it is this program being a bad neighbour.
+///
+/// So the pairing is read **once** per process, by [`cached`], and every
+/// later caller gets the same value back. The offset between a host's clock
+/// and a guest's is established at the start and applied as arithmetic
+/// afterwards, exactly as the bare-metal kernel does it.
+///
+/// The count is exposed rather than merely promised, so that "once" is
+/// something a user can check rather than something this documentation
+/// asserts. See [`host_queries`].
+static HOST_QUERIES: AtomicU32 = AtomicU32::new(0);
+
+/// How many host-clock pairings this process has requested. Should be one.
+pub fn host_queries() -> u32 {
+    HOST_QUERIES.load(Ordering::Relaxed)
+}
+
+/// The process-wide host synchronisation, read once.
+///
+/// Every caller that wants to know how this machine relates to its host
+/// should come through here. Calling [`HostSync::read`] directly issues a
+/// fresh hypercall, which is right exactly once — at startup — and wrong
+/// everywhere else. See [`HOST_QUERIES`].
+pub fn cached() -> &'static HostSync {
+    static CACHE: OnceLock<HostSync> = OnceLock::new();
+    CACHE.get_or_init(HostSync::read)
+}
+
 impl HostSync {
     /// Reads whatever synchronisation this machine offers.
     pub fn read() -> HostSync {
@@ -120,6 +166,7 @@ impl ClockPairing {
     #[cfg(target_os = "linux")]
     pub fn read() -> Option<ClockPairing> {
         let index = kvm_ptp_index()?;
+        HOST_QUERIES.fetch_add(1, Ordering::Relaxed);
         read_precise_offset(index)
     }
 
@@ -252,7 +299,10 @@ mod tests {
     /// Whatever this machine is, the report has to be internally consistent.
     #[test]
     fn host_sync_is_self_consistent() {
-        let sync = HostSync::read();
+        // The cache, not a fresh read: on a KVM guest `HostSync::read` is a
+        // hypercall, and a test suite is no more entitled to spend one per
+        // run than a measurement loop is.
+        let sync = cached();
         assert_eq!(
             sync.monotonic_follows_host(),
             sync.paravirtual_clocksource.is_some()
@@ -351,5 +401,59 @@ mod tests {
             "host and guest are a day apart: {} ns",
             pairing.host_offset_ns()
         );
+    }
+}
+
+#[cfg(test)]
+mod once_tests {
+    use super::*;
+
+    /// The pairing is read once per process, however many times it is asked
+    /// for.
+    ///
+    /// The point is not performance. `PTP_SYS_OFFSET_PRECISE` is serviced by
+    /// a hypercall out of this guest and into a host that other tenants are
+    /// running on, so a program that asked per measurement would be taking
+    /// scheduling events out of somebody else's machine to re-answer a
+    /// question whose answer does not change.
+    ///
+    /// Holds on a machine with no `ptp_kvm` too: there the count stays at
+    /// zero, which is also not more than one.
+    #[test]
+    fn the_host_is_asked_at_most_once_however_often_it_is_read() {
+        // Measured as a delta rather than against zero. The whole test binary
+        // is one process and its tests run in parallel, so the count is
+        // shared: an absolute assertion here would be asserting something
+        // about the rest of the suite, and would pass or fail by scheduling
+        // order. What has to hold is the invariant that matters — that going
+        // through the cache never asks again.
+        let _ = cached();
+        let after_first = host_queries();
+
+        for _ in 0..1_000 {
+            let _ = cached();
+        }
+
+        assert_eq!(
+            host_queries(),
+            after_first,
+            "a thousand reads through the cache issued {} further hypercall(s); \
+             the host must be asked once and the offset applied as arithmetic",
+            host_queries() - after_first
+        );
+        assert!(
+            after_first <= 1,
+            "initialising the cache took {after_first} hypercalls"
+        );
+    }
+
+    /// And the cache hands back the same reading every time, rather than a
+    /// fresh one that happens not to have been counted.
+    #[test]
+    fn the_cached_pairing_is_stable() {
+        let first = cached().pairing;
+        for _ in 0..100 {
+            assert_eq!(cached().pairing, first);
+        }
     }
 }

@@ -7,9 +7,13 @@
 //! process measures for the same work is that floor plus the operating
 //! system.
 
-use crate::pmu::{CorePmu, CounterRoute, FIXED_CORE_CYCLES, FIXED_INSTRUCTIONS};
+use crate::pmu::{CorePmu, CounterRoute};
+#[cfg(target_arch = "x86_64")]
+use crate::progress::{self, Phase};
 use crate::{arch, println};
 use nanochrono_core::arch as counters;
+#[cfg(target_arch = "x86_64")]
+use nanochrono_core::aml::{GpioInterrupt, Namespace, Provenance};
 use nanochrono_core::redundancy::Protected;
 
 /// Runs every check and reports it over the serial port.
@@ -21,11 +25,454 @@ pub unsafe fn run() {
     println!("arch: {}", counters::ARCH.name());
     println!();
 
+    #[cfg(target_arch = "x86_64")]
+    progress::phase(Phase::CpuFeatures, report_cpu);
+    #[cfg(not(target_arch = "x86_64"))]
     report_cpu();
+
+    // SAFETY: forwarded from this function's own contract.
+    #[cfg(target_arch = "x86_64")]
+    progress::enter(Phase::Pmu);
     // SAFETY: forwarded from this function's own contract.
     unsafe { report_pmu() };
+    #[cfg(target_arch = "x86_64")]
+    progress::leave(Phase::Pmu);
+    #[cfg(target_arch = "x86_64")]
+    progress::phase(Phase::Counter, report_counter);
+    #[cfg(not(target_arch = "x86_64"))]
     report_counter();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        progress::enter(Phase::Pci);
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { report_usb() };
+        // SAFETY: as above; reads firmware tables only.
+        unsafe { report_acpi_namespace() };
+        progress::leave(Phase::Pci);
+    }
+    #[cfg(target_arch = "x86_64")]
+    progress::enter(Phase::Hypervisor);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { report_hypervisor() };
+    #[cfg(target_arch = "x86_64")]
+    progress::leave(Phase::Hypervisor);
+
     report_integrity();
+}
+
+/// What USB host controllers this machine has.
+///
+/// Reports what PCI enumeration found and stops there. Bringing a controller
+/// up is deliberately *not* done here: `Input::init` does it, once, and doing
+/// it in both places meant resetting a controller that already had a device
+/// addressed and an endpoint configured. Under an emulator a second reset is
+/// survivable; on real hardware it is a controller that stops answering, and
+/// three bounded waits of ten million iterations each looks exactly like a
+/// hang.
+///
+/// # Safety
+/// Reads PCI configuration space; requires ring 0.
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_usb() {
+    use crate::pci;
+
+    println!("== USB host controllers ==");
+    let mut found = 0;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        pci::scan(|dev| {
+            if let Some(kind) = dev.usb_kind() {
+                found += 1;
+                println!("  {:04x}:{:04x}  {}", dev.vendor, dev.device, kind.name());
+                println!(
+                    "    {:02x}:{:02x}.{}  bar0={}",
+                    dev.bus,
+                    dev.slot,
+                    dev.function,
+                    Hex(dev.bar0)
+                );
+                if kind == pci::UsbKind::Xhci {
+                    // The two bring-up steps an emulator never exercises. A
+                    // controller that asks for scratchpad pages and a
+                    // firmware that owns it are both real-hardware-only, and
+                    // both are silent failures when skipped.
+                    // SAFETY: reads capability registers only.
+                    let (scratchpad, firmware_owned) = crate::xhci::survey(&dev);
+                    println!("    scratchpad pages : {scratchpad}");
+                    println!(
+                        "    owned by firmware: {}",
+                        if firmware_owned { "yes" } else { "no" }
+                    );
+                }
+            }
+            true
+        })
+    };
+    if found == 0 {
+        println!("  none; input is whatever firmware translated to the 8042");
+    } else {
+        println!("  brought up by the input layer, once, when PS/2 finds nothing");
+    }
+    println!();
+}
+
+/// What the firmware's AML says is on this machine.
+///
+/// Printed because the namespace walk is the least verifiable thing in this
+/// kernel from the outside: an I2C-HID touchpad that does not appear could be
+/// a machine with no touchpad, a table that would not parse, or a walk that
+/// stopped after three objects. The device count separates those — a real
+/// DSDT holds dozens, and a number in the single digits means the walk gave
+/// up rather than the machine being empty.
+///
+/// # Safety
+/// Reads firmware tables; requires ring 0 and an identity map.
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_acpi_namespace() {
+    use nanochrono_core::aml::{Namespace, I2C_HID_CID};
+
+    println!("== ACPI namespace ==");
+    // SAFETY: forwarded from this function's own contract.
+    let (source, xsdt) = unsafe { crate::acpi::root_source() };
+    println!(
+        "  root table     : {} ({})",
+        source.name(),
+        if xsdt { "xsdt" } else { "rsdt" }
+    );
+    // SAFETY: as above.
+    println!(
+        "  legacy scan    : {}",
+        if unsafe { crate::acpi::legacy_scan_works() } {
+            "finds an RSDP (BIOS boot)"
+        } else {
+            "finds nothing (UEFI boot: only the loader knows)"
+        }
+    );
+
+    // SAFETY: as above.
+    let Some(table) = (unsafe { crate::acpi::dsdt() }) else {
+        println!("  no DSDT, or one whose checksum did not verify");
+        println!();
+        return;
+    };
+    println!("  dsdt           : {} bytes", table.len());
+
+    let Some(namespace) = Namespace::new(table) else {
+        println!("  the table's length field does not fit the table");
+        println!();
+        return;
+    };
+
+    let mut devices = 0u32;
+    let mut with_ids = 0u32;
+    namespace.for_each_device(|device| {
+        devices += 1;
+        if device.hid.is_some() || device.cid.is_some() {
+            with_ids += 1;
+        }
+        true
+    });
+    println!("  devices        : {devices} ({with_ids} with a _HID or _CID)");
+
+    // The SSDTs are part of the namespace, not an extra. Firmware routinely
+    // declares a device in the DSDT and the bus it sits on in an SSDT, so
+    // "how many are there, and do they walk" is worth a line of its own.
+    // SAFETY: reads firmware tables; ring 0 and an identity map, as above.
+    let mut ssdts = 0usize;
+    let mut ssdt_devices = 0u32;
+    let mut ssdt_bytes = 0usize;
+    unsafe {
+        crate::acpi::for_each_ssdt(|table| {
+            ssdts += 1;
+            ssdt_bytes += table.len();
+            if let Some(ssdt) = Namespace::new(table) {
+                ssdt.for_each_device(|_| {
+                    ssdt_devices += 1;
+                    true
+                });
+            }
+            true
+        })
+    };
+    println!("  ssdts          : {ssdts} ({ssdt_bytes} bytes, {ssdt_devices} more devices)");
+
+    // The inventory itself, so "no SSDTs" and "SSDTs this could not read"
+    // are different answers rather than the same line.
+    let mut inventory = crate::text::Text::<160>::new();
+    // SAFETY: as above.
+    unsafe {
+        crate::acpi::for_each_table_signature(|signature| {
+            if !inventory.is_empty() {
+                inventory.push(b' ');
+            }
+            inventory.str(core::str::from_utf8(&signature).unwrap_or("????"));
+            // The buffer is the bound, not a count: a machine with thirty
+            // tables should list as many as fit rather than an arbitrary
+            // prefix chosen here.
+            inventory.has_room_for(5)
+        })
+    };
+    println!("  tables         : {}", inventory.as_str());
+
+    // Looked for across every table, the way the driver does.
+    let mut in_ssdt = None;
+    if namespace.find_device(|device| device.is(I2C_HID_CID)).is_none() {
+        // SAFETY: as above.
+        unsafe {
+            crate::acpi::for_each_ssdt(|table| {
+                let Some(ssdt) = Namespace::new(table) else {
+                    return true;
+                };
+                if let Some(device) = ssdt.find_device(|device| device.is(I2C_HID_CID)) {
+                    in_ssdt = Some(device.path);
+                    return false;
+                }
+                true
+            })
+        };
+        if let Some(path) = in_ssdt {
+            let mut rendered = [0u8; 64];
+            let used = path.render(&mut rendered);
+            println!(
+                "  i2c-hid        : {} (in an SSDT, not the DSDT)",
+                core::str::from_utf8(&rendered[..used]).unwrap_or("?")
+            );
+        }
+    }
+
+    match namespace.find_device(|device| device.is(I2C_HID_CID)) {
+        Some(device) => {
+            let mut path = [0u8; 64];
+            let used = device.path.render(&mut path);
+            println!(
+                "  i2c-hid        : {}",
+                core::str::from_utf8(&path[..used]).unwrap_or("?")
+            );
+            if let Some(hid) = device.hid {
+                println!("    _HID         : {}", hid.as_str());
+            }
+            let mut scratch = [0u8; 32];
+            match namespace.find_i2c_hid(&mut scratch) {
+                Some(found) => {
+                    println!("    slave        : {}", Hex(found.bus.slave_address as u64));
+                    println!("    bus speed    : {} Hz", found.bus.connection_speed);
+                    match found.descriptor_register {
+                        Some(register) => {
+                            println!("    descriptor   : {}", Hex(register as u64))
+                        }
+                        None => println!(
+                            "    descriptor   : _DSM not evaluable; the driver will probe for it"
+                        ),
+                    }
+                    println!("    resources    : {}", match found.provenance {
+                        Provenance::Crs => "from _CRS",
+                        Provenance::DeclaredBuffers => {
+                            "_CRS not evaluable; read from the device's declared buffers"
+                        }
+                    });
+                    report_controller(&namespace, &found.bus.controller);
+                    match found.interrupt {
+                        Some(interrupt) => {
+                            println!("    gpio pin     : {}", interrupt.pin);
+                            #[cfg(target_arch = "x86_64")]
+                            report_gpio(&namespace, interrupt);
+                        }
+                        None => println!("    gpio pin     : none declared"),
+                    }
+                }
+                None => println!("    _CRS/_DSM    : not readable by this interpreter"),
+            }
+        }
+        None => println!("  i2c-hid        : no PNP0C50 device on this machine"),
+    }
+    println!();
+}
+
+/// Reports where the I2C controller a `_CRS` names was found, and its `_ADR`.
+///
+/// The step that failed on the machine this was written against. The
+/// touchpad's `Device (TPD0)` is in the DSDT; the `Device (I2C5)` it hangs
+/// off is in one of sixteen SSDTs, and a reader that looks only at the DSDT
+/// resolves the controller by name and then finds nothing declaring it.
+/// Printing which table it came from is what tells those two apart.
+///
+/// # Safety
+///
+/// Reads firmware tables. Reads only, and every failure is a printed line.
+#[cfg(target_arch = "x86_64")]
+fn report_controller(namespace: &Namespace, wanted: &nanochrono_core::aml::Path) {
+    use nanochrono_core::aml::Value;
+
+    let mut rendered = [0u8; 64];
+    let used = wanted.render(&mut rendered);
+    println!(
+        "    controller   : {}",
+        core::str::from_utf8(&rendered[..used]).unwrap_or("?")
+    );
+
+    let adr = |ns: &Namespace| -> Option<u64> {
+        let device = ns.find_device(|candidate| candidate.path.ends_with(wanted))?;
+        match ns.evaluate(&device, b"_ADR", &[]) {
+            Some(Value::Integer(value)) => Some(value),
+            _ => None,
+        }
+    };
+
+    let mut source = "";
+    let mut address = adr(namespace);
+    if address.is_some() {
+        source = "dsdt";
+    } else {
+        let mut index = 0usize;
+        let mut which = 0usize;
+        // SAFETY: reads firmware tables; ring 0 and an identity map.
+        unsafe {
+            crate::acpi::for_each_ssdt(|table| {
+                index += 1;
+                let Some(ssdt) = Namespace::new(table) else {
+                    return true;
+                };
+                if let Some(found) = adr(&ssdt) {
+                    address = Some(found);
+                    which = index;
+                    return false;
+                }
+                true
+            })
+        };
+        if address.is_some() {
+            source = "ssdt";
+            println!("    found in     : ssdt #{which}");
+        }
+    }
+
+    match address {
+        Some(address) => println!(
+            "    _ADR         : {} -> {:02}.{} ({source})",
+            Hex(address),
+            (address >> 16) & 0x1F,
+            address & 0x07
+        ),
+        None => println!("    _ADR         : no table declares this controller with one"),
+    }
+}
+
+/// Reports whether the pin an I2C-HID device declared can actually be read.
+///
+/// This is the readiness gate's own diagnostic: it says which route the
+/// driver would take before the driver takes it, so a machine where the gate
+/// does not close can be told apart from one where it was never tried.
+///
+/// # Safety
+///
+/// Reads firmware-declared MMIO. Reads only, and every failure is a printed
+/// line rather than a fault.
+#[cfg(target_arch = "x86_64")]
+fn report_gpio(namespace: &Namespace, interrupt: GpioInterrupt) {
+    let mut path = [0u8; 64];
+    let used = interrupt.controller.render(&mut path);
+    println!(
+        "    gpio ctrl    : {}",
+        core::str::from_utf8(&path[..used]).unwrap_or("?")
+    );
+
+    let device = namespace.find_device(|candidate| candidate.path.ends_with(&interrupt.controller));
+    let hid = device.and_then(|candidate| candidate.hid);
+    let hid_str = hid.as_ref().map(|id| id.as_str());
+
+    // SAFETY: the windows come from `_CRS` and are inside the identity map;
+    // `Controller::open` only reads.
+    let Some(controller) =
+        (unsafe { crate::gpio::Controller::open(namespace, &interrupt.controller, hid_str) })
+    else {
+        println!("    gpio windows : none usable; the gate will poll blind");
+        return;
+    };
+    println!(
+        "    gpio windows : {} communit{}, part {}",
+        controller.communities(),
+        if controller.communities() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        controller.platform().unwrap_or("unrecognised")
+    );
+
+    match controller.resolve(interrupt.pin) {
+        Some(pad) if controller.verify(pad) => {
+            println!("    readiness    : gated by pin {} (table)", interrupt.pin)
+        }
+        Some(_) => println!("    readiness    : table maps the pin, hardware disagrees; will calibrate"),
+        None => {
+            let calibration = controller.begin_calibration();
+            println!(
+                "    readiness    : no table; calibrating against {} candidate pads",
+                calibration.watching()
+            );
+        }
+    }
+}
+
+/// Detection and host-time negotiation.
+///
+/// Mandatory here, unlike the hosted build: at ring 0 the hypercall is
+/// available, it cannot be spoofed by clearing a CPUID bit, and it is the only
+/// way to express a guest timestamp on the host's timebase.
+///
+/// # Safety
+/// Issues a hypercall; requires ring 0 / EL1.
+unsafe fn report_hypervisor() {
+    println!("== Hypervisor ==");
+    // SAFETY: forwarded from this function's own contract.
+    let report = unsafe { crate::hypervisor::detect() };
+
+    println!("  cpuid bit      : {}", yes_no(report.cpuid_bit));
+    let sig = report.signature_str();
+    println!(
+        "  signature      : {}",
+        if sig.is_empty() { "none" } else { sig }
+    );
+    if report.max_leaf != 0 {
+        println!("  max hv leaf    : {}", Hex(report.max_leaf as u64));
+    }
+    println!("  hypercall      : {}", yes_no(report.hypercall_ok));
+    // The number that has to stay small. See `hypervisor::hypercalls`.
+    println!(
+        "  hypercalls     : {} (asked once; the stopwatch reads the counter)",
+        report.hypercalls
+    );
+
+    match report.pairing {
+        Some(p) => {
+            println!("  host clock     : {} ns", p.host_ns);
+            println!("  paired counter : {}", p.counter);
+            println!("  the guest timebase can be expressed on the host's");
+        }
+        None if report.is_virtualized() => {
+            println!("  no clock pairing: this hypervisor does not offer one");
+        }
+        None => println!("  bare metal: the counter is physical"),
+    }
+    println!();
+}
+
+fn yes_no(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Hexadecimal, for a build with no formatter beyond `core`.
+struct Hex(u64);
+
+impl core::fmt::Display for Hex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
 }
 
 fn report_cpu() {
@@ -35,6 +482,27 @@ fn report_cpu() {
     // needs formatting machinery an allocator-free build does not have.
     #[cfg(target_arch = "x86_64")]
     {
+        // Who made the part, and what follows from it. Not decoration: the
+        // vendor decides whether `CPUID.15H`/`16H` may be believed as a
+        // counter rate, which is the number every measurement below is
+        // divided by. See `nanochrono_core::cpu::Vendor`.
+        let vendor = nanochrono_core::cpu::vendor();
+        println!("  vendor         : {} ({})", vendor.name(), vendor.as_str());
+        let centaur = nanochrono_core::cpu::centaur_max_leaf();
+        if centaur != 0 {
+            // Only the Centaur/Zhaoxin lineage implements this range, so a
+            // value here identifies the part even where the vendor string
+            // has been overridden.
+            println!("  centaur leaves : up to {}", Hex(centaur as u64));
+        }
+        println!(
+            "  tsc leaves     : {}",
+            if vendor.states_a_trustworthy_tsc_rate() {
+                "CPUID.15H/16H trusted (Intel)"
+            } else {
+                "not trusted for this vendor; the counter is measured instead"
+            }
+        );
         println!("  sse2={} avx={} avx2={}", f.sse2, f.avx, f.avx2);
         println!(
             "  avx512f={} aesni={} shani={}",
@@ -130,6 +598,11 @@ unsafe fn report_pmu() {
     let mut pmu = CorePmu::detect();
 
     println!("  core type      : {}", pmu.core_type.name());
+    // Which register interface the counters live behind, decided from the
+    // vendor before any MSR was touched. On a part this does not recognise it
+    // reads `unknown` and nothing was programmed — which is the safe answer,
+    // not a failure to try.
+    println!("  interface      : {}", pmu.kind.name());
     println!("  version        : {}", pmu.leaf.version);
     println!(
         "  general        : {} counters, {} bits",
@@ -188,20 +661,17 @@ unsafe fn report_pmu() {
         None => println!("  measurement discarded: the core type changed mid-run"),
     }
 
-    // The instruction count is only meaningful from the fixed counter; the
-    // general-purpose fallback is programmed for cycles alone.
-    if route == CounterRoute::Fixed {
-        // SAFETY: as above; the index is checked against what this core
-        // reports.
-        if let Some(insns) = unsafe { pmu.read(FIXED_INSTRUCTIONS) } {
-            println!("    instructions : {}", insns.value);
-        }
+    // The instruction count is meaningful from more than the fixed counter:
+    // on AMD it is a general-purpose counter programmed with the architectural
+    // retired-instructions event, read back over the same MSR route.
+    // SAFETY: as above; the method refuses a counter this did not program.
+    if let Some(insns) = unsafe { pmu.read_instructions() } {
+        println!("    instructions : {}", insns.value);
     }
     // SAFETY: as above.
     if let Some(cyc) = unsafe { pmu.read_cycles() } {
         println!("    core cycles  : {}", cyc.value);
     }
-    let _ = FIXED_CORE_CYCLES;
     println!();
 }
 
@@ -216,8 +686,8 @@ fn report_counter() {
     let mut min = u64::MAX;
     let mut max = 0u64;
     for _ in 0..ROUNDS {
-        // The freestanding read, which on AArch64 is the physical counter
-        // with a full barrier rather than the virtual one.
+        // The freestanding read, which on AArch64 is the virtual counter by
+        // default, or the physical one when the physical counter is enabled.
         let a = arch::counter_ordered();
         let b = arch::counter_ordered();
         let d = b.wrapping_sub(a);
@@ -237,7 +707,18 @@ fn report_counter() {
     println!("  jitter         : {} units", max - min);
 
     #[cfg(target_arch = "aarch64")]
-    println!("  cntfrq_el0     : {} Hz", counters::aarch64::cntfrq());
+    {
+        println!(
+            "  counter        : {} ({} Hz)",
+            arch::counter_source().name(),
+            counters::aarch64::cntfrq()
+        );
+        if arch::counter_source() == crate::arch::CounterSource::Physical {
+            println!(
+                "  warning        : physical counter — not recommended inside a VM"
+            );
+        }
+    }
     println!();
 }
 

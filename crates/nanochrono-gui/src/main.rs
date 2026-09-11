@@ -69,13 +69,45 @@ fn window_settings() -> window::Settings {
     }
 }
 
+/// The application icon, as bytes, for every platform that wants it.
+///
+/// One asset for all three desktops: `assets/nanochrono.ico`, which is an ICO
+/// container around a single 256x256 PNG. Windows takes the `.ico` directly,
+/// macOS wants it converted to an `.icns` at packaging time, and Linux needs
+/// both a PNG in the icon theme and this, decoded, for the window itself.
+pub const ICON_ICO: &[u8] = include_bytes!("../../../assets/nanochrono.ico");
+
 /// Decodes the bundled application icon.
 ///
-/// Used by the X11 window manager for the title bar and task switcher. Wayland
-/// ignores it and takes the icon from the `.desktop` entry matched by
-/// `application_id` instead, which is why both are set.
+/// Used by the X11 window manager for the title bar and task switcher, and by
+/// Windows for the window's own icon. Wayland ignores it and takes the icon
+/// from the `.desktop` entry matched by `application_id` instead, which is why
+/// both are set — and why a missing `.desktop` icon shows as a generic
+/// placeholder however good this one is.
+///
+/// The format is named rather than sniffed. `from_file_data(.., None)` asks
+/// the `image` crate to guess, and guessing only works if the ICO decoder was
+/// compiled in — which it was not, because `iced` does not enable that feature
+/// on its copy of `image`. The call failed on every start, the `.ok()` here
+/// threw the error away, and the window ran with no icon at all. Decoding
+/// explicitly makes the dependency real, and the log below makes a failure
+/// something you can see.
 fn window_icon() -> Option<window::Icon> {
-    window::icon::from_file_data(include_bytes!("../../../assets/nanochrono.ico"), None).ok()
+    let decoded = match image::load_from_memory_with_format(ICON_ICO, image::ImageFormat::Ico) {
+        Ok(image) => image.to_rgba8(),
+        Err(error) => {
+            eprintln!("nanochrono-gui: could not decode the application icon: {error}");
+            return None;
+        }
+    };
+    let (width, height) = decoded.dimensions();
+    match window::icon::from_rgba(decoded.into_raw(), width, height) {
+        Ok(icon) => Some(icon),
+        Err(error) => {
+            eprintln!("nanochrono-gui: could not build the application icon: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1427,4 +1459,48 @@ async fn calibrate() -> StableClockState {
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    /// The application icon must actually decode.
+    ///
+    /// This is the test the project did not have, and its absence cost a
+    /// release: `window::icon::from_file_data(.., None)` asks the `image`
+    /// crate to sniff the format, which only works if the ICO decoder was
+    /// compiled in — and `iced` does not enable that feature on its copy of
+    /// `image`. The call failed on every start, the `.ok()` discarded the
+    /// error, and the window ran with no icon while everything still built
+    /// and ran. Nothing but an assertion catches a failure that is designed
+    /// to be silent.
+    #[test]
+    fn the_application_icon_decodes() {
+        assert!(
+            window_icon().is_some(),
+            "the bundled icon did not decode; the window would run without one"
+        );
+    }
+
+    /// And it must be square, because every platform's icon slot is.
+    ///
+    /// The repository also contains a 1020x225 wordmark, and installing that
+    /// as the desktop icon is what made Linux show an illegible sliver of
+    /// lettering instead of the logo. Pointing this constant at the wrong
+    /// asset should fail here rather than on somebody's desktop.
+    #[test]
+    fn the_application_icon_is_square() {
+        let decoded = image::load_from_memory_with_format(ICON_ICO, image::ImageFormat::Ico)
+            .expect("the icon decodes");
+        let (width, height) = (decoded.width(), decoded.height());
+        assert_eq!(
+            width, height,
+            "the icon is {width}x{height}; an icon has to be square"
+        );
+        assert!(
+            width >= 256,
+            "the icon is {width}px; desktops ask for 256 and macOS for 512"
+        );
+    }
 }

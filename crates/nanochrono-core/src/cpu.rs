@@ -364,6 +364,133 @@ fn hwcap2_has(bit: u64) -> bool {
     }
 }
 
+/// Who made this x86 processor, by the twelve bytes `CPUID.0H` returns.
+///
+/// # Why this is more than a label
+///
+/// Because what a part is decides which of its CPUID leaves can be believed.
+/// The clearest case is the TSC: leaves `15H` and `16H` state the counter's
+/// frequency exactly, and Linux reads them **only on Intel** — every other
+/// vendor falls through to measuring the counter against a timer, because
+/// their values have not proved trustworthy. A chronometer that took a
+/// stated frequency from a part whose statement Linux refuses would be
+/// building every subsequent number on it.
+///
+/// Zhaoxin is the case that prompted this. Its parts are x86-64 descended
+/// from VIA's Centaur line, they carry Intel-style architectural PMUs and
+/// VMX, and they are close enough to Intel that code which assumes "not AMD
+/// means Intel" runs on them and quietly misreads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vendor {
+    Intel,
+    Amd,
+    /// Zhaoxin — `"  Shanghai  "`, spaces included. The joint venture that
+    /// took over VIA's x86 line.
+    Zhaoxin,
+    /// VIA/Centaur — `"CentaurHauls"`. The lineage Zhaoxin continues, and
+    /// still what some parts report.
+    Centaur,
+    /// A vendor string this does not recognise, kept so it can be shown
+    /// rather than flattened to "other".
+    Other([u8; 12]),
+}
+
+impl Vendor {
+    /// Decodes the twelve bytes `CPUID.0H` returns in EBX, EDX, ECX.
+    ///
+    /// That register order is not a mistake: it is the order the instruction
+    /// defines, and reading them as EBX, ECX, EDX spells `GenuntelineI`.
+    pub const fn from_signature(signature: [u8; 12]) -> Vendor {
+        match &signature {
+            b"GenuineIntel" => Vendor::Intel,
+            b"AuthenticAMD" => Vendor::Amd,
+            b"  Shanghai  " => Vendor::Zhaoxin,
+            b"CentaurHauls" => Vendor::Centaur,
+            _ => Vendor::Other(signature),
+        }
+    }
+
+    /// The signature as written, for display.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Vendor::Intel => "GenuineIntel",
+            Vendor::Amd => "AuthenticAMD",
+            Vendor::Zhaoxin => "  Shanghai  ",
+            Vendor::Centaur => "CentaurHauls",
+            Vendor::Other(raw) => core::str::from_utf8(raw).unwrap_or("?"),
+        }
+    }
+
+    /// A readable name.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Vendor::Intel => "Intel",
+            Vendor::Amd => "AMD",
+            Vendor::Zhaoxin => "Zhaoxin",
+            Vendor::Centaur => "VIA/Centaur",
+            Vendor::Other(_) => "unknown",
+        }
+    }
+
+    /// Whether `CPUID.15H` and `CPUID.16H` may be believed as a counter rate.
+    ///
+    /// Intel only, which is the rule Linux applies in `native_calibrate_tsc`
+    /// and `cpu_khz_from_cpuid`. Everything else measures instead — slower to
+    /// establish and correct by construction, which is the right trade for a
+    /// number every later measurement is divided by.
+    pub const fn states_a_trustworthy_tsc_rate(&self) -> bool {
+        matches!(self, Vendor::Intel)
+    }
+
+    /// Whether the part implements the Centaur extended CPUID range at
+    /// `0xC000_0000`.
+    ///
+    /// Only this lineage does — it is to Centaur what `0x8000_0000` is to
+    /// AMD — so a non-zero maximum there is positive identification even
+    /// where the vendor string has been changed.
+    pub const fn has_centaur_leaves(&self) -> bool {
+        matches!(self, Vendor::Zhaoxin | Vendor::Centaur)
+    }
+
+    /// Whether this part is Intel-compatible for the architectural PMU,
+    /// machine-check banks and topology leaves.
+    ///
+    /// True for Zhaoxin and Centaur as well as Intel: Linux groups all three
+    /// for the architectural performance monitoring leaf, and Zhaoxin's own
+    /// PMU driver reads `CPUID.0AH` and requires version 2 — the same
+    /// interface, not an imitation of it.
+    pub const fn uses_intel_architectural_pmu(&self) -> bool {
+        matches!(self, Vendor::Intel | Vendor::Zhaoxin | Vendor::Centaur)
+    }
+}
+
+/// This machine's CPU vendor.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub fn vendor() -> Vendor {
+    use crate::arch::x86::cpuid;
+    let [_, ebx, ecx, edx] = cpuid(0, 0);
+    let mut signature = [0u8; 12];
+    signature[0..4].copy_from_slice(&ebx.to_le_bytes());
+    signature[4..8].copy_from_slice(&edx.to_le_bytes());
+    signature[8..12].copy_from_slice(&ecx.to_le_bytes());
+    Vendor::from_signature(signature)
+}
+
+/// The highest Centaur extended leaf this part answers, or zero.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub fn centaur_max_leaf() -> u32 {
+    use crate::arch::x86::cpuid;
+    let max = cpuid(0xC000_0000, 0)[0];
+    // A part without the range answers with whatever the highest leaf it does
+    // implement returns, so the value only means something if it is inside
+    // the range it claims to describe.
+    if (0xC000_0000..=0xC000_FFFF).contains(&max) {
+        max
+    } else {
+        0
+    }
+}
+
 /// Vendor brand string, when the architecture exposes one.
 #[cfg(feature = "std")]
 pub fn brand_string() -> Option<String> {
@@ -399,5 +526,118 @@ pub fn brand_string() -> Option<String> {
     ))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod vendor_tests {
+    use super::*;
+
+    /// The four signatures this knows, byte for byte.
+    ///
+    /// Zhaoxin's is the one worth pinning: it is `"  Shanghai  "` — two
+    /// leading spaces and two trailing, because the field is exactly twelve
+    /// bytes and the name is eight. Trimming it, or writing it without the
+    /// padding, produces a string that never matches and a part that is
+    /// silently treated as unknown.
+    #[test]
+    fn the_vendor_signatures_are_exact() {
+        assert_eq!(Vendor::from_signature(*b"GenuineIntel"), Vendor::Intel);
+        assert_eq!(Vendor::from_signature(*b"AuthenticAMD"), Vendor::Amd);
+        assert_eq!(Vendor::from_signature(*b"  Shanghai  "), Vendor::Zhaoxin);
+        assert_eq!(Vendor::from_signature(*b"CentaurHauls"), Vendor::Centaur);
+
+        // Every signature is twelve bytes; the register triple has no room
+        // for more and no padding for less.
+        for vendor in [Vendor::Intel, Vendor::Amd, Vendor::Zhaoxin, Vendor::Centaur] {
+            assert_eq!(
+                vendor.as_str().len(),
+                12,
+                "{} does not round-trip as twelve bytes",
+                vendor.name()
+            );
+        }
+    }
+
+    /// A trimmed Zhaoxin string is not a Zhaoxin string.
+    ///
+    /// The mistake this guards against is writing the match arm as
+    /// `b"Shanghai"`, which compiles, never matches, and leaves the part
+    /// reported as unknown — and therefore treated as though its TSC leaves
+    /// had never been ruled out.
+    #[test]
+    fn a_trimmed_zhaoxin_signature_does_not_match() {
+        assert!(matches!(
+            Vendor::from_signature(*b"Shanghai    "),
+            Vendor::Other(_)
+        ));
+        assert!(matches!(
+            Vendor::from_signature(*b"  Shanghai\0\0"),
+            Vendor::Other(_)
+        ));
+    }
+
+    /// Only Intel's counter-rate leaves are believed.
+    ///
+    /// This is the rule Linux applies in `native_calibrate_tsc` and
+    /// `cpu_khz_from_cpuid`, and the reason it matters is that the result is
+    /// the divisor of every later measurement: a wrong rate does not produce
+    /// a wrong reading, it produces every reading wrong by the same factor,
+    /// which is far harder to notice.
+    #[test]
+    fn only_intel_states_a_trustworthy_counter_rate() {
+        assert!(Vendor::Intel.states_a_trustworthy_tsc_rate());
+        for vendor in [
+            Vendor::Amd,
+            Vendor::Zhaoxin,
+            Vendor::Centaur,
+            Vendor::Other(*b"____________"),
+        ] {
+            assert!(
+                !vendor.states_a_trustworthy_tsc_rate(),
+                "{} must fall through to measuring the counter",
+                vendor.name()
+            );
+        }
+    }
+
+    /// Zhaoxin and Centaur share Intel's architectural PMU, and have the
+    /// Centaur extended range that Intel and AMD do not.
+    #[test]
+    fn the_zhaoxin_lineage_is_grouped_correctly() {
+        for vendor in [Vendor::Zhaoxin, Vendor::Centaur] {
+            assert!(vendor.has_centaur_leaves(), "{}", vendor.name());
+            assert!(vendor.uses_intel_architectural_pmu(), "{}", vendor.name());
+        }
+        assert!(Vendor::Intel.uses_intel_architectural_pmu());
+        assert!(!Vendor::Intel.has_centaur_leaves());
+        assert!(!Vendor::Amd.has_centaur_leaves());
+        assert!(!Vendor::Amd.uses_intel_architectural_pmu());
+    }
+
+    /// The register order is EBX, EDX, ECX — not EBX, ECX, EDX.
+    ///
+    /// Getting it wrong spells `GenuntelineI`, which is exactly the kind of
+    /// error that looks like a typo in a string constant and is really a
+    /// misread of the instruction.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[test]
+    fn this_machines_vendor_decodes_to_something_real() {
+        let vendor = vendor();
+        assert!(
+            !matches!(vendor, Vendor::Other(_)) || vendor.as_str().is_ascii(),
+            "the vendor decoded to something that is not even text: {:?}",
+            vendor
+        );
+        // Whatever this machine is, the string has to be printable — a
+        // scrambled register order produces bytes that are not.
+        assert!(
+            vendor
+                .as_str()
+                .chars()
+                .all(|c| c.is_ascii_graphic() || c == ' '),
+            "the vendor string is not printable: {:?}",
+            vendor.as_str()
+        );
     }
 }

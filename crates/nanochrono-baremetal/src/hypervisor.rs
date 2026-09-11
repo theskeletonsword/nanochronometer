@@ -27,6 +27,35 @@
 //! `arch/x86/include/uapi/asm/kvm_para.h`; the AArch64 PTP function ID is
 //! `ARM_SMCCC_VENDOR_HYP_KVM_PTP_FUNC_ID`, `0x86000001`.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Every hypercall this machine has issued.
+///
+/// # Why it is counted at all
+///
+/// Because the measurement depends on it staying at one. A hypercall is a
+/// `VMCALL`: a trap out of the guest, into the host kernel, and back. It costs
+/// microseconds — thousands of times a counter read — and, worse for a
+/// chronometer, it costs a *variable* number of them, because what happens on
+/// the other side is another operating system's scheduler.
+///
+/// So the host clock is asked for exactly once, at boot, to learn the offset
+/// between this machine's counter and the host's. After that the stopwatch
+/// reads `RDTSC` and nothing else: the pairing is arithmetic applied to a
+/// counter, not a question asked again. A stopwatch that issued a hypercall
+/// per sample would be measuring the hypercall.
+///
+/// Counting them turns that from a claim in a comment into something the
+/// screen shows. The hypervisor panel reports this number; if a change ever
+/// puts a hypercall in the frame loop, it stops reading `1` and starts
+/// climbing, in front of whoever is looking.
+static HYPERCALLS: AtomicU32 = AtomicU32::new(0);
+
+/// How many hypercalls have been issued since power-on.
+pub fn hypercalls() -> u32 {
+    HYPERCALLS.load(Ordering::Relaxed)
+}
+
 /// What was found, and how.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Report {
@@ -42,6 +71,11 @@ pub struct Report {
     pub hypercall_ok: bool,
     /// Host time paired with this machine's counter, if the host offered it.
     pub pairing: Option<ClockPairing>,
+    /// How many hypercalls the machine has issued, in total, ever.
+    ///
+    /// The whole point is that this is a small number and never grows. See
+    /// [`hypercalls`].
+    pub hypercalls: u32,
 }
 
 impl Report {
@@ -143,18 +177,27 @@ mod x86 {
             report.signature[8..12].copy_from_slice(&leaf[3].to_le_bytes());
         }
 
-        // The active probe. At CPL 0 this either returns or faults, and a
-        // fault is unrecoverable without an IDT — so it is only attempted
-        // where something already indicated a hypervisor. On bare metal
-        // `VMCALL` is `#UD`, and this kernel has no handler for one.
-        if report.is_virtualized() || report.max_leaf != 0 {
-            // SAFETY: guarded on evidence of a hypervisor, and the caller
-            // guarantees CPL 0.
+        // The active probe, and the guard it needs.
+        //
+        // `VMCALL` at CPL 0 under a hypervisor that implements it returns.
+        // Anywhere else it is `#UD`, and this kernel has no IDT — so the
+        // fault is a triple fault, not an error code. "Something looks like a
+        // hypervisor" is *not* a sufficient guard: QEMU's TCG advertises the
+        // vendor leaf as `TCGTCGTCGTCG` and implements no KVM hypercall at
+        // all, which was exactly how this first went wrong.
+        //
+        // So the signature has to be KVM's specifically. `KVM_HC_*` is KVM's
+        // interface; no other hypervisor answers it, and guessing costs the
+        // machine.
+        if report.signature_str().starts_with("KVMKVMKVM") {
+            // SAFETY: the vendor leaf identifies KVM, which implements this
+            // hypercall, and the caller guarantees CPL 0.
             unsafe {
                 report.pairing = clock_pairing();
                 report.hypercall_ok = report.pairing.is_some();
             }
         }
+        report.hypercalls = super::hypercalls();
         report
     }
 
@@ -164,17 +207,25 @@ mod x86 {
     /// Issues `VMCALL`; requires CPL 0 *and* a hypervisor that implements it.
     /// Without one this is `#UD` with no handler.
     unsafe fn clock_pairing() -> Option<ClockPairing> {
+        super::HYPERCALLS.fetch_add(1, super::Ordering::Relaxed);
+
         // The identity map means the virtual address is the physical one.
         let gpa = &raw const PAIRING as u64;
         let ret: i64;
 
         // SAFETY: the caller guarantees CPL 0 and that a hypervisor is
         // present. The host writes only into the buffer `gpa` names.
+        //
+        // RBX is shuttled through another register: LLVM reserves it and
+        // rejects it as an operand, which is the same reason `cpuid` in
+        // `nanochrono-core` is written this way.
         unsafe {
             core::arch::asm!(
+                "xchg rbx, {gpa}",
                 "vmcall",
+                "xchg rbx, {gpa}",
+                gpa = inout(reg) gpa => _,
                 inlateout("rax") KVM_HC_CLOCK_PAIRING => ret,
-                in("rbx") gpa,
                 in("rcx") KVM_CLOCK_PAIRING_WALLCLOCK,
                 options(nostack),
             );
@@ -257,6 +308,7 @@ mod arm {
                 });
             }
         }
+        report.hypercalls = super::hypercalls();
         report
     }
 
@@ -264,6 +316,8 @@ mod arm {
     /// Requires EL1, and an EL2 handler — an `HVC` with none is undefined and
     /// this kernel has no vector table to recover through.
     unsafe fn hvc(function: u64, arg: u64) -> [u64; 4] {
+        super::HYPERCALLS.fetch_add(1, super::Ordering::Relaxed);
+
         let mut regs = [0u64; 4];
         // SAFETY: forwarded from this function's own contract. Both function
         // IDs used here are read-only queries.

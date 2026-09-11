@@ -9,11 +9,16 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_arch = "x86_64")]
+use nanochrono_baremetal::acpi;
 #[allow(unused_imports)]
 use nanochrono_baremetal::println;
 use nanochrono_baremetal::{arch, selftest, serial::Serial};
+// Only the text-mode banner names it, and that path is x86 firmware.
 #[cfg(target_arch = "x86_64")]
-use nanochrono_baremetal::{gui, multiboot, panic};
+use nanochrono_baremetal::VERSION;
+#[cfg(target_arch = "x86_64")]
+use nanochrono_baremetal::{gui, multiboot, panic, progress};
 
 /// What a multiboot2 loader leaves in `EAX`. GRUB2 uses this one.
 ///
@@ -54,14 +59,43 @@ pub unsafe extern "C" fn kmain(magic: u64, multiboot_info: u64) -> ! {
     // works over serial, which is why the tag is marked optional.
     // SAFETY: `multiboot_info` is what the boot stub passed through from the
     // loader, and the magic above says whether it means anything.
-    let fb = unsafe { multiboot::framebuffer(multiboot_info) };
+    let mut fb = unsafe { multiboot::framebuffer(multiboot_info) };
+
+    // Where ACPI's root table is. **Only the loader can say this on a UEFI
+    // machine**: the RSDP's address comes from the EFI configuration table,
+    // and nothing puts a copy where the legacy scan looks — so a kernel that
+    // only scans finds no ACPI at all on a recent laptop, and everything that
+    // depends on the DSDT fails with it.
+    // SAFETY: as above.
+    if let Some(rsdp) = unsafe { multiboot::acpi_rsdp(multiboot_info) } {
+        acpi::set_root_table(rsdp);
+    }
+
+    // How much memory the machine has, which the interface reports and which
+    // only the loader can say.
+    // SAFETY: as above.
+    let memory = unsafe { multiboot::memory(multiboot_info) };
+
+    // The back buffer, before anything is drawn. Everything after this point
+    // draws into RAM and copies out only what changed — see
+    // `framebuffer` for why an uncached firmware framebuffer cannot be
+    // animated directly.
+    if let Some(surface) = fb.as_mut() {
+        // SAFETY: called once, here, before any drawing.
+        let composited = unsafe { surface.attach_back_buffer() };
+        if !composited {
+            println!("mode too large for the back buffer; drawing directly");
+        }
+    }
     // Handed to the panic handler, which takes no arguments and so cannot be
     // given one any other way.
     panic::set_framebuffer(fb);
 
-    // SAFETY: at CPL 0, which is where the selftest's PMU programming needs
-    // to happen.
-    unsafe { selftest::run() };
+    // And to the progress marker, before anything that could stop. On a
+    // machine with no serial port this is the only way to see how far a boot
+    // got — see `progress`.
+    progress::attach(fb);
+    progress::leave(progress::Phase::Entered);
 
     match fb {
         // SAFETY: at CPL 0, with a framebuffer the loader described.
@@ -70,11 +104,31 @@ pub unsafe extern "C" fn kmain(magic: u64, multiboot_info: u64) -> ! {
                 "framebuffer: {}x{}, drawing the interface",
                 fb.width, fb.height
             );
+            // SAFETY: at CPL 0, which the selftest's PMU programming needs.
+            unsafe { selftest::run() };
             // SAFETY: at CPL 0, with a framebuffer the loader described.
-            unsafe { gui::run(fb) }
+            unsafe { gui::run(fb, memory) }
         }
         None => {
-            println!("no graphics mode; the serial report above is the whole run");
+            // No linear framebuffer. On a BIOS machine the loader left a VGA
+            // text mode behind, and that is somewhere to say so — without it
+            // this halts with no output at all and the loader's last message
+            // stays on screen, which is indistinguishable from a kernel that
+            // never started. That is exactly how this failed on real
+            // hardware.
+            // SAFETY: at CPL 0. On a UEFI machine the write reaches ordinary
+            // RAM and is merely invisible.
+            unsafe { nanochrono_baremetal::vga::activate() };
+            println!();
+            println!("NanoChronometer {} — freestanding", VERSION);
+            println!();
+            println!("No linear framebuffer: the loader handed over a text mode.");
+            println!("The graphical interface needs one; the measurements below do not.");
+            println!();
+            // SAFETY: at CPL 0, which the selftest's PMU programming needs.
+            unsafe { selftest::run() };
+            println!();
+            println!("Boot with gfxpayload=keep for the interface.");
             arch::halt()
         }
     }

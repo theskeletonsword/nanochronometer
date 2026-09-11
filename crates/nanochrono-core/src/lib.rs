@@ -60,9 +60,21 @@
 
 // Available with or without an OS: pure instruction sequences and the types
 // that describe them.
+/// Reading the firmware's ACPI Machine Language.
+///
+/// `no_std` and free of privilege: it is a parser over a byte slice, so the
+/// freestanding kernel and a hosted test can run the same code over the same
+/// table. That is deliberate — see the module docs.
+pub mod aml;
 pub mod arch;
 pub mod backend;
 pub mod cpu;
+/// Reading a HID report descriptor to find a pointer.
+///
+/// `no_std` and pure: the freestanding kernel and a hosted test run it over
+/// the same bytes, which is what lets a real touchpad's descriptor be a test
+/// fixture rather than a hardware dependency.
+pub mod hid_report;
 pub mod pmu_leaf;
 pub mod redundancy;
 pub mod simd;
@@ -77,6 +89,10 @@ pub mod dispatch;
 pub mod format;
 #[cfg(feature = "std")]
 pub mod hypervisor;
+/// The Linux kernel's crypto API, reached from ring 3 and timed. Compiled in
+/// everywhere; reports itself unavailable off Linux.
+#[cfg(feature = "std")]
+pub mod kcrypto;
 #[cfg(feature = "std")]
 pub mod kvmclock;
 #[cfg(feature = "std")]

@@ -511,19 +511,37 @@ mod tests {
         if !is_available() {
             return;
         }
+        // Open this thread's counter *before* doing the work it is meant to
+        // measure. `THREAD_COUNTER` is a lazily-initialised thread-local, so
+        // the first read is what creates the event — and an earlier version
+        // of this test burned two million iterations first, which the counter
+        // therefore did not exist for. Both threads then reported a few
+        // thousand cycles of scheduling noise and the assertion below became
+        // a coin flip: it failed about one run in five and, worse, told the
+        // truth about nothing on the other four.
+        read_thread_cycles().expect("counter available");
+
         let mut acc = 0u64;
-        for i in 0..2_000_000u64 {
+        for i in 0..40_000_000u64 {
             acc = acc.wrapping_add(i).rotate_left(3);
         }
         std::hint::black_box(acc);
         let this_thread = read_thread_cycles().expect("counter available");
+        assert!(
+            this_thread > 1_000_000,
+            "the counter reported {this_thread} cycles for forty million \
+             iterations; it is not counting"
+        );
 
         let other_thread = std::thread::spawn(|| read_thread_cycles().unwrap_or(0))
             .join()
             .expect("counter thread");
 
+        // An order of magnitude. If the counter were shared the two would be
+        // within a hair of each other, so this separates the two outcomes
+        // with room to spare in either direction.
         assert!(
-            other_thread < this_thread,
+            other_thread.saturating_mul(8) < this_thread,
             "a fresh thread reported {other_thread} against this thread's {this_thread}; \
              the counter is shared when it should be per-thread"
         );

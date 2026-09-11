@@ -111,6 +111,35 @@ pub unsafe extern "C" fn nc_bm_counter() -> u64 {
     crate::arch::counter_ordered()
 }
 
+/// Which AArch64 counter the kernel reads: 0 `CNTVCT_EL0` (virtual, default,
+/// safe under a hypervisor), 1 `CNTPCT_EL0` (physical, bare metal only).
+///
+/// This reports the current selection, the same number a later
+/// [`nc_bm_counter_source_set`] call would need to change it.
+#[no_mangle]
+pub extern "C" fn nc_bm_counter_source() -> u32 {
+    crate::arch::counter_source().as_u8() as u32
+}
+
+/// Selects which AArch64 counter the kernel reads.
+///
+/// Pass the result of [`nc_bm_counter_source`]: 0 for the virtual counter
+/// (default), 1 for the physical counter. The physical counter is **not
+/// recommended inside a VM** — it exposes and splices together the host's
+/// real timeline — so a loader should only set it on bare metal.
+///
+/// This is the backing store for the interface's *Enable Physical Counter*
+/// toggle; on x86-64 it is a no-op, since there is one counter and no choice.
+///
+/// Returns the previously selected source (0 or 1).
+#[no_mangle]
+pub extern "C" fn nc_bm_counter_source_set(counter: u32) -> u32 {
+    let source = crate::arch::CounterSource::from_u8(counter as u8);
+    let previous = crate::arch::counter_source();
+    crate::arch::set_counter_source(source);
+    previous.as_u8() as u32
+}
+
 fn flatten(pmu: &CorePmu) -> nc_bm_pmu_t {
     use nanochrono_core::pmu_leaf::CoreType;
     nc_bm_pmu_t {

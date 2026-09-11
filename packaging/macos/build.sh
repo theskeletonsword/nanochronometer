@@ -138,6 +138,18 @@ make_app_bundle() {
     local app="${arch_dir}/NanoChronometer.app"
     mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
     cp "${arch_dir}/nanochrono-gui" "${app}/Contents/MacOS/NanoChronometer"
+
+    # The Dock and Finder icon. Built from the same assets/nanochrono.ico that
+    # Windows and Linux use, so there is one drawing in the tree.
+    #
+    # Written by a script rather than by `iconutil`, which is macOS-only:
+    # cross-compiling from Linux is the normal case here, and a bundle that
+    # silently shipped without an icon whenever it was built on the wrong host
+    # is exactly the kind of thing nobody notices until it is released.
+    python3 "${repo_root}/tools/extract-icon.py" \
+        "${repo_root}/assets/nanochrono.ico" \
+        "${app}/Contents/Resources/NanoChronometer.icns"
+
     sed -e "s/@VERSION@/${version}/g" \
         "${repo_root}/packaging/macos/Info.plist.in" \
         > "${app}/Contents/Info.plist"
